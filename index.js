@@ -1,43 +1,123 @@
 (function(exports, metro, common, patcher, assets, components, toasts, utils) {
 "use strict";
 
-const { findByProps, findByStoreName } = metro;
-const { clipboard, FluxDispatcher, React } = common;
-const { after, before } = patcher;
+const {
+    findByProps,
+    findByPropsAll,
+    findByStoreName,
+    findAll
+} = metro;
+
+const {
+    clipboard,
+    FluxDispatcher,
+    React
+} = common;
+
+const {
+    after,
+    before
+} = patcher;
+
 const { getAssetIDByName } = assets;
 const { Forms } = components;
 const { showToast } = toasts;
 const { findInReactTree } = utils;
 
-const BUILD = "0.6.0";
+const BUILD = "0.7.0";
 const BLUE_MARKER = "🔵 ";
+const DEBUG_LIMIT = 220;
 
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
-const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
+const ActionSheetRow =
+    findByProps("ActionSheetRow")?.ActionSheetRow ??
+    Forms.FormRow;
+
 const MessageStore = findByStoreName("MessageStore");
-const NativeEventUtils = findByProps("getNativeSyntheticEventData");
 
 const selected = new Map();
 const originals = new Map();
-const pendingTaps = new Map();
-const recentTaps = new Map();
-const suppressedLongPresses = new Map();
+const debugLog = [];
+const jsxUnpatches = [];
+const miscUnpatches = [];
+const wrappedTapFns = new WeakMap();
+const hookedJsxTargets = new Set();
 
 let selectionMode = false;
 let selectionChannelId = null;
 let actionSheetUnpatch = null;
-let nativeEventUnpatch = null;
+let jsxHookCount = 0;
+let tapPropSeenCount = 0;
+let tapCallCount = 0;
 
 function icon() {
-    try { return getAssetIDByName("ic_message_copy"); }
-    catch (_) { return undefined; }
+    try {
+        return getAssetIDByName("ic_message_copy");
+    } catch (_) {
+        return undefined;
+    }
 }
 
 function toast(text) {
-    try { showToast(text, icon()); }
-    catch (_) {
-        try { showToast(text); } catch (_) {}
+    try {
+        showToast(text, icon());
+    } catch (_) {
+        try {
+            showToast(text);
+        } catch (_) {}
     }
+}
+
+function safeKeys(value) {
+    try {
+        if (!value || (typeof value !== "object" && typeof value !== "function")) {
+            return [];
+        }
+        return Object.keys(value).slice(0, 30);
+    } catch (_) {
+        return [];
+    }
+}
+
+function shortValue(value) {
+    try {
+        if (value == null) return value;
+        if (typeof value === "string") {
+            return value.length > 180 ? value.slice(0, 180) + "…" : value;
+        }
+        if (typeof value === "number" || typeof value === "boolean") return value;
+        if (Array.isArray(value)) return `[array:${value.length}]`;
+        if (typeof value === "function") return `[function:${value.name || "anonymous"}]`;
+        return `{${safeKeys(value).join(",")}}`;
+    } catch (_) {
+        return "[unreadable]";
+    }
+}
+
+function debug(tag, data) {
+    try {
+        let line = `${new Date().toISOString()} | ${tag}`;
+
+        if (data !== undefined) {
+            if (typeof data === "string") {
+                line += ` | ${data}`;
+            } else {
+                const compact = {};
+
+                for (const [key, value] of Object.entries(data ?? {})) {
+                    compact[key] = shortValue(value);
+                }
+
+                line += ` | ${JSON.stringify(compact)}`;
+            }
+        }
+
+        debugLog.push(line);
+
+        if (debugLog.length > DEBUG_LIMIT) {
+            debugLog.splice(0, debugLog.length - DEBUG_LIMIT);
+        }
+    } catch (_) {}
 }
 
 function channelOf(message) {
@@ -59,6 +139,7 @@ function getMessage(channelId, messageId, fallback) {
 function cleanMessage(message) {
     const channelId = channelOf(message);
     const key = `${channelId}:${message?.id}`;
+
     let content = originals.get(key) ?? message?.content ?? "";
 
     if (typeof content === "string" && content.startsWith(BLUE_MARKER)) {
@@ -74,17 +155,30 @@ function cleanMessage(message) {
 
 function paint(message, enabled) {
     const channelId = channelOf(message);
-    if (!message?.id || !channelId || !FluxDispatcher?.dispatch) return;
+
+    if (!message?.id || !channelId || !FluxDispatcher?.dispatch) {
+        debug("paint.skip", {
+            id: message?.id,
+            channelId,
+            dispatcher: Boolean(FluxDispatcher?.dispatch)
+        });
+        return;
+    }
 
     const key = `${channelId}:${message.id}`;
     const current = getMessage(channelId, message.id, message) ?? message;
 
     if (enabled) {
         if (!originals.has(key)) {
-            let content = typeof current.content === "string" ? current.content : "";
+            let content =
+                typeof current.content === "string"
+                    ? current.content
+                    : "";
+
             if (content.startsWith(BLUE_MARKER)) {
                 content = content.slice(BLUE_MARKER.length);
             }
+
             originals.set(key, content);
         }
 
@@ -116,13 +210,31 @@ function paint(message, enabled) {
     originals.delete(key);
 }
 
-function setSelected(message, enabled, showToast = true) {
+function setSelected(message, enabled, showToast = true, source = "unknown") {
     const channelId = channelOf(message);
-    if (!message?.id || !channelId) return;
 
-    if (!selectionChannelId) selectionChannelId = channelId;
+    if (!message?.id || !channelId) {
+        debug("selection.invalid-message", {
+            source,
+            id: message?.id,
+            channelId,
+            keys: safeKeys(message)
+        });
+        return;
+    }
+
+    if (!selectionChannelId) {
+        selectionChannelId = channelId;
+    }
 
     if (channelId !== selectionChannelId) {
+        debug("selection.wrong-channel", {
+            source,
+            channelId,
+            expected: selectionChannelId,
+            messageId: message.id
+        });
+
         toast("Выбор работает только в текущем чате");
         return;
     }
@@ -142,29 +254,29 @@ function setSelected(message, enabled, showToast = true) {
         paint(normalized, false);
     }
 
-    if (showToast) toast(`Выбрано: ${selected.size}`);
-}
+    debug("selection.changed", {
+        source,
+        enabled,
+        count: selected.size,
+        messageId: normalized.id,
+        channelId
+    });
 
-function toggleSelected(message) {
-    const key = keyOf(message);
-    setSelected(message, !selected.has(key), true);
-}
-
-function clearPending() {
-    for (const timer of pendingTaps.values()) {
-        try { clearTimeout(timer); } catch (_) {}
+    if (showToast) {
+        toast(`Выбрано: ${selected.size}`);
     }
+}
 
-    pendingTaps.clear();
-    recentTaps.clear();
-    suppressedLongPresses.clear();
+function toggleSelected(message, source) {
+    const key = keyOf(message);
+    setSelected(message, !selected.has(key), true, source);
 }
 
 function cancelSelection(show = true) {
-    clearPending();
-
     for (const message of selected.values()) {
-        try { paint(message, false); } catch (_) {}
+        try {
+            paint(message, false);
+        } catch (_) {}
     }
 
     selected.clear();
@@ -172,46 +284,77 @@ function cancelSelection(show = true) {
     selectionMode = false;
     selectionChannelId = null;
 
-    try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+    debug("selection.cancel");
 
-    if (show) toast("Выбор отменён");
+    try {
+        LazyActionSheet?.hideActionSheet?.();
+    } catch (_) {}
+
+    if (show) {
+        toast("Выбор отменён");
+    }
 }
 
 function beginSelection(message) {
     cancelSelection(false);
 
     const channelId = channelOf(message);
-    if (!message?.id || !channelId) return;
+
+    if (!message?.id || !channelId) {
+        debug("selection.begin-failed", {
+            id: message?.id,
+            channelId,
+            keys: safeKeys(message)
+        });
+        return;
+    }
 
     selectionMode = true;
     selectionChannelId = channelId;
 
-    setSelected({
-        ...message,
-        channel_id: channelId
-    }, true, false);
+    setSelected(
+        {
+            ...message,
+            channel_id: channelId
+        },
+        true,
+        false,
+        "long-press-menu"
+    );
 
-    try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+    debug("selection.begin", {
+        messageId: message.id,
+        channelId,
+        jsxHookCount,
+        tapPropSeenCount
+    });
+
+    try {
+        LazyActionSheet?.hideActionSheet?.();
+    } catch (_) {}
+
     toast(`Выбрано: 1 | v${BUILD}`);
 }
 
-function dataFromNativeResult(result, fallbackPayload) {
+function extractTapInfo(event) {
     const candidates = [];
 
-    if (result && typeof result === "object") candidates.push(result);
-
     try {
-        if (fallbackPayload?.nativeEvent) candidates.push(fallbackPayload.nativeEvent);
+        if (event?.nativeEvent) {
+            candidates.push(event.nativeEvent);
+        }
     } catch (_) {}
 
-    if (fallbackPayload && typeof fallbackPayload === "object") candidates.push(fallbackPayload);
+    if (event && typeof event === "object") {
+        candidates.push(event);
+    }
 
     for (const data of candidates) {
         const messageId =
             data?.messageId ??
             data?.message_id ??
-            data?.id ??
-            data?.message?.id;
+            data?.message?.id ??
+            data?.id;
 
         const channelId =
             data?.channelId ??
@@ -224,7 +367,8 @@ function dataFromNativeResult(result, fallbackPayload) {
             return {
                 messageId: String(messageId),
                 channelId: String(channelId),
-                fallback: data?.message
+                fallback: data?.message ?? null,
+                keys: safeKeys(data)
             };
         }
     }
@@ -232,97 +376,439 @@ function dataFromNativeResult(result, fallbackPayload) {
     return null;
 }
 
-function isSuppressed(key) {
-    const at = suppressedLongPresses.get(key);
-    if (!at) return false;
+function handleObservedTap(event, source = "jsx.onTapMessage") {
+    tapCallCount++;
 
-    if (Date.now() - at > 900) {
-        suppressedLongPresses.delete(key);
+    const info = extractTapInfo(event);
+
+    debug("tap.call", {
+        source,
+        tapCallCount,
+        selectionMode,
+        nativeKeys: safeKeys(event?.nativeEvent),
+        rootKeys: safeKeys(event),
+        messageId: info?.messageId,
+        channelId: info?.channelId
+    });
+
+    if (!selectionMode) {
         return false;
     }
+
+    if (!info) {
+        toast("Tap пойман, но ID сообщения не найден");
+        return true;
+    }
+
+    const message = getMessage(
+        info.channelId,
+        info.messageId,
+        info.fallback
+    );
+
+    debug("tap.resolve", {
+        source,
+        messageId: info.messageId,
+        channelId: info.channelId,
+        found: Boolean(message),
+        content: message?.content,
+        authorId: message?.author?.id,
+        author: message?.author?.username
+    });
+
+    if (!message) {
+        toast(`Tap ${info.messageId}, но MessageStore его не нашёл`);
+        return true;
+    }
+
+    toggleSelected(
+        {
+            ...message,
+            channel_id: info.channelId
+        },
+        source
+    );
 
     return true;
 }
 
-function scheduleMessageTap(info) {
-    if (!selectionMode || !info?.messageId || !info?.channelId) return;
-
-    const key = `${info.channelId}:${info.messageId}`;
-    const now = Date.now();
-
-    if (isSuppressed(key)) return;
-
-    const recent = recentTaps.get(key);
-    if (recent && now - recent < 300) return;
-
-    if (pendingTaps.has(key)) return;
-
-    const timer = setTimeout(() => {
-        pendingTaps.delete(key);
-
-        if (!selectionMode || isSuppressed(key)) return;
-
-        const last = recentTaps.get(key);
-        const current = Date.now();
-        if (last && current - last < 300) return;
-
-        const message = getMessage(info.channelId, info.messageId, info.fallback);
-        if (!message) return;
-
-        recentTaps.set(key, current);
-
-        toggleSelected({
-            ...message,
-            channel_id: info.channelId
-        });
-    }, 45);
-
-    pendingTaps.set(key, timer);
-}
-
-function suppressLongPress(message) {
-    if (!selectionMode) return;
-
-    const channelId = channelOf(message) ?? selectionChannelId;
-    const messageId = message?.id;
-    if (!channelId || !messageId) return;
-
-    const key = `${channelId}:${messageId}`;
-    suppressedLongPresses.set(key, Date.now());
-
-    const timer = pendingTaps.get(key);
-    if (timer) {
-        try { clearTimeout(timer); } catch (_) {}
-        pendingTaps.delete(key);
+function wrapTapFunction(original, source) {
+    if (typeof original !== "function") {
+        return original;
     }
 
-    setTimeout(() => {
-        const at = suppressedLongPresses.get(key);
-        if (at && Date.now() - at >= 850) {
-            suppressedLongPresses.delete(key);
+    const existing = wrappedTapFns.get(original);
+    if (existing) return existing;
+
+    function wrappedTap() {
+        const args = Array.from(arguments);
+        const consumed = handleObservedTap(
+            args?.[0],
+            source
+        );
+
+        if (consumed) {
+            return;
         }
-    }, 950);
+
+        return original.apply(this, args);
+    }
+
+    wrappedTap.__telegramSelectionOriginal = original;
+    wrappedTapFns.set(original, wrappedTap);
+
+    return wrappedTap;
 }
 
-function patchNativeEventDecoder() {
-    if (!NativeEventUtils?.getNativeSyntheticEventData || nativeEventUnpatch) return;
+function patchJsxRuntime(target, label) {
+    if (!target || hookedJsxTargets.has(target)) return;
+
+    const keys = ["jsx", "jsxs", "jsxDEV"];
+    let hooked = false;
+
+    for (const key of keys) {
+        if (typeof target?.[key] !== "function") continue;
+
+        try {
+            const unpatch = before(
+                key,
+                target,
+                args => {
+                    try {
+                        const props = args?.[1];
+
+                        if (
+                            !props ||
+                            typeof props !== "object" ||
+                            typeof props.onTapMessage !== "function"
+                        ) {
+                            return;
+                        }
+
+                        tapPropSeenCount++;
+
+                        debug("jsx.onTapMessage-prop", {
+                            label,
+                            key,
+                            tapPropSeenCount,
+                            propsKeys: safeKeys(props),
+                            fnName: props.onTapMessage?.name
+                        });
+
+                        const wrapped = wrapTapFunction(
+                            props.onTapMessage,
+                            `${label}.${key}.onTapMessage`
+                        );
+
+                        try {
+                            props.onTapMessage = wrapped;
+                        } catch (_) {
+                            try {
+                                args[1] = {
+                                    ...props,
+                                    onTapMessage: wrapped
+                                };
+                            } catch (_) {}
+                        }
+
+                        return args;
+                    } catch (error) {
+                        debug("jsx.patch-error", {
+                            label,
+                            key,
+                            error: String(error)
+                        });
+                    }
+                }
+            );
+
+            jsxUnpatches.push(unpatch);
+            jsxHookCount++;
+            hooked = true;
+        } catch (error) {
+            debug("jsx.hook-failed", {
+                label,
+                key,
+                error: String(error)
+            });
+        }
+    }
+
+    if (hooked) {
+        hookedJsxTargets.add(target);
+    }
+}
+
+function installJsxHooks() {
+    const targets = [];
 
     try {
-        nativeEventUnpatch = after(
-            "getNativeSyntheticEventData",
-            NativeEventUtils,
-            (args, result) => {
-                if (!selectionMode) return;
+        if (typeof findByPropsAll === "function") {
+            const found = findByPropsAll("jsx", "jsxs");
 
-                try {
-                    const info = dataFromNativeResult(result, args?.[0]);
-                    if (info) scheduleMessageTap(info);
-                } catch (_) {}
+            if (Array.isArray(found)) {
+                targets.push(...found);
+            }
+        }
+    } catch (error) {
+        debug("findByPropsAll.jsx.error", String(error));
+    }
+
+    if (!targets.length) {
+        try {
+            if (typeof findAll === "function") {
+                const found = findAll(module => {
+                    try {
+                        return (
+                            typeof module?.jsx === "function" ||
+                            typeof module?.jsxs === "function" ||
+                            typeof module?.default?.jsx === "function" ||
+                            typeof module?.default?.jsxs === "function"
+                        );
+                    } catch (_) {
+                        return false;
+                    }
+                });
+
+                if (Array.isArray(found)) {
+                    targets.push(...found);
+                }
+            }
+        } catch (error) {
+            debug("findAll.jsx.error", String(error));
+        }
+    }
+
+    const unique = new Set();
+
+    targets.forEach((target, index) => {
+        if (!target || unique.has(target)) return;
+        unique.add(target);
+
+        patchJsxRuntime(
+            target,
+            `jsxRuntime#${index}`
+        );
+
+        try {
+            if (target.default && target.default !== target) {
+                patchJsxRuntime(
+                    target.default,
+                    `jsxRuntime#${index}.default`
+                );
+            }
+        } catch (_) {}
+    });
+
+    debug("jsx.install", {
+        targets: unique.size,
+        hooks: jsxHookCount
+    });
+}
+
+function patchDiagnosticFunction(target, key, label) {
+    if (!target || typeof target?.[key] !== "function") return;
+
+    try {
+        const unpatch = after(
+            key,
+            target,
+            (args, result) => {
+                const first = args?.[0];
+
+                debug(`diag.${label}.${key}`, {
+                    argKeys: safeKeys(first),
+                    nativeKeys: safeKeys(first?.nativeEvent),
+                    resultKeys: safeKeys(result),
+                    resultMessageId:
+                        result?.messageId ??
+                        result?.message_id ??
+                        result?.id,
+                    argMessageId:
+                        first?.nativeEvent?.messageId ??
+                        first?.messageId
+                });
             }
         );
-    } catch (_) {
-        nativeEventUnpatch = null;
+
+        miscUnpatches.push(unpatch);
+    } catch (error) {
+        debug("diag.patch-failed", {
+            label,
+            key,
+            error: String(error)
+        });
     }
+}
+
+function installDiagnosticHooks() {
+    const candidates = [];
+
+    try {
+        if (typeof findAll === "function") {
+            const found = findAll(module => {
+                try {
+                    const objects = [
+                        module,
+                        module?.default
+                    ];
+
+                    return objects.some(obj =>
+                        obj &&
+                        (
+                            typeof obj.getNativeSyntheticEventData === "function" ||
+                            typeof obj.handleTapMessage === "function" ||
+                            typeof obj.onTapMessage === "function" ||
+                            typeof obj.handleLongPressMessage === "function"
+                        )
+                    );
+                } catch (_) {
+                    return false;
+                }
+            });
+
+            if (Array.isArray(found)) {
+                candidates.push(...found);
+            }
+        }
+    } catch (error) {
+        debug("diag.findAll.error", String(error));
+    }
+
+    const seen = new Set();
+
+    candidates.slice(0, 60).forEach((module, index) => {
+        for (const pair of [
+            [module, `module#${index}`],
+            [module?.default, `module#${index}.default`]
+        ]) {
+            const target = pair[0];
+            const label = pair[1];
+
+            if (!target || seen.has(target)) continue;
+            seen.add(target);
+
+            debug("diag.candidate", {
+                label,
+                keys: safeKeys(target)
+            });
+
+            for (const key of [
+                "getNativeSyntheticEventData",
+                "handleTapMessage",
+                "onTapMessage",
+                "handleLongPressMessage"
+            ]) {
+                patchDiagnosticFunction(
+                    target,
+                    key,
+                    label
+                );
+            }
+        }
+    });
+
+    try {
+        const handlersModule = findByProps("MessagesHandlers");
+        const prototype = handlersModule?.MessagesHandlers?.prototype;
+
+        debug("diag.MessagesHandlers", {
+            found: Boolean(handlersModule),
+            moduleKeys: safeKeys(handlersModule),
+            prototypeKeys: safeKeys(prototype)
+        });
+
+        if (prototype) {
+            for (const name of [
+                "params",
+                "handlers",
+                "_params",
+                "messageHandlers"
+            ]) {
+                let descriptor;
+
+                try {
+                    descriptor =
+                        Object.getOwnPropertyDescriptor(
+                            prototype,
+                            name
+                        );
+                } catch (_) {}
+
+                if (
+                    !descriptor?.get ||
+                    descriptor.configurable === false
+                ) {
+                    continue;
+                }
+
+                const originalGetter = descriptor.get;
+
+                function wrappedGetter() {
+                    const value = originalGetter.call(this);
+
+                    debug("diag.handler-getter", {
+                        name,
+                        thisKeys: safeKeys(this),
+                        valueKeys: safeKeys(value),
+                        thisTap: typeof this?.handleTapMessage,
+                        valueTap: typeof value?.handleTapMessage
+                    });
+
+                    try {
+                        patchDiagnosticFunction(
+                            this,
+                            "handleTapMessage",
+                            `instance.${name}.this`
+                        );
+                    } catch (_) {}
+
+                    try {
+                        patchDiagnosticFunction(
+                            value,
+                            "handleTapMessage",
+                            `instance.${name}.value`
+                        );
+                    } catch (_) {}
+
+                    return value;
+                }
+
+                try {
+                    Object.defineProperty(
+                        prototype,
+                        name,
+                        {
+                            ...descriptor,
+                            get: wrappedGetter
+                        }
+                    );
+
+                    miscUnpatches.push(() => {
+                        try {
+                            Object.defineProperty(
+                                prototype,
+                                name,
+                                descriptor
+                            );
+                        } catch (_) {}
+                    });
+                } catch (error) {
+                    debug("diag.getter-wrap-failed", {
+                        name,
+                        error: String(error)
+                    });
+                }
+            }
+        }
+    } catch (error) {
+        debug("diag.MessagesHandlers.error", String(error));
+    }
+
+    debug("diag.install", {
+        candidates: candidates.length,
+        hooks: miscUnpatches.length
+    });
 }
 
 function toArray(value) {
@@ -339,9 +825,13 @@ function formatTime(timestamp) {
 
     try {
         const d = new Date(timestamp);
-        if (Number.isNaN(d.getTime())) return String(timestamp);
 
-        const p = n => String(n).padStart(2, "0");
+        if (Number.isNaN(d.getTime())) {
+            return String(timestamp);
+        }
+
+        const p = n =>
+            String(n).padStart(2, "0");
 
         return (
             `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ` +
@@ -355,10 +845,20 @@ function formatTime(timestamp) {
 
 function authorInfo(message) {
     const a = message?.author ?? {};
-    const username = a.username ?? a.name ?? "unknown";
-    const globalName = a.global_name ?? a.globalName ?? a.displayName ?? "";
+    const username =
+        a.username ??
+        a.name ??
+        "unknown";
+
+    const globalName =
+        a.global_name ??
+        a.globalName ??
+        a.displayName ??
+        "";
+
     const discriminator =
-        a.discriminator && a.discriminator !== "0"
+        a.discriminator &&
+        a.discriminator !== "0"
             ? `#${a.discriminator}`
             : "";
 
@@ -381,7 +881,11 @@ function attachmentLines(message) {
     const lines = ["Вложения:"];
 
     list.forEach((a, i) => {
-        const url = a?.url ?? a?.proxy_url ?? a?.proxyURL ?? "";
+        const url =
+            a?.url ??
+            a?.proxy_url ??
+            a?.proxyURL ??
+            "";
 
         lines.push(
             `${i + 1}. ${a?.filename ?? a?.name ?? "file"}` +
@@ -396,8 +900,14 @@ function attachmentLines(message) {
 }
 
 function replyLines(message) {
-    const ref = message?.message_reference ?? message?.messageReference;
-    const quoted = message?.referenced_message ?? message?.referencedMessage;
+    const ref =
+        message?.message_reference ??
+        message?.messageReference;
+
+    const quoted =
+        message?.referenced_message ??
+        message?.referencedMessage;
+
     const lines = [];
 
     if (ref) {
@@ -410,10 +920,15 @@ function replyLines(message) {
 
     if (quoted) {
         const a = authorInfo(quoted);
-        lines.push(`Цитируемый автор: ${a.display} | author_id=${a.id}`);
+
+        lines.push(
+            `Цитируемый автор: ${a.display} | author_id=${a.id}`
+        );
 
         if (quoted.content) {
-            lines.push(`Цитируемый текст: ${quoted.content}`);
+            lines.push(
+                `Цитируемый текст: ${quoted.content}`
+            );
         }
     }
 
@@ -423,8 +938,15 @@ function replyLines(message) {
 function messageToText(message) {
     const m = cleanMessage(message);
     const a = authorInfo(m);
-    const timestamp = m?.timestamp ?? m?.created_at ?? m?.createdAt;
-    const edited = m?.edited_timestamp ?? m?.editedTimestamp;
+
+    const timestamp =
+        m?.timestamp ??
+        m?.created_at ??
+        m?.createdAt;
+
+    const edited =
+        m?.edited_timestamp ??
+        m?.editedTimestamp;
 
     const lines = [
         `Время: ${formatTime(timestamp)}`,
@@ -441,63 +963,45 @@ function messageToText(message) {
         `system: ${a.system}`
     ];
 
-    if (edited) lines.push(`Изменено: ${formatTime(edited)}`);
+    if (edited) {
+        lines.push(`Изменено: ${formatTime(edited)}`);
+    }
 
     lines.push(...replyLines(m));
 
     const mentions = toArray(m?.mentions);
+
     if (mentions.length) {
         lines.push(
-            `Упоминания: ${mentions.map(u =>
-                `${u?.username ?? u?.global_name ?? "user"}(${u?.id ?? "?"})`
-            ).join(", ")}`
+            `Упоминания: ${mentions
+                .map(
+                    u =>
+                        `${u?.username ?? u?.global_name ?? "user"}(${u?.id ?? "?"})`
+                )
+                .join(", ")}`
         );
     }
 
-    const roles = toArray(m?.mention_roles ?? m?.mentionRoles);
+    const roles = toArray(
+        m?.mention_roles ??
+        m?.mentionRoles
+    );
+
     if (roles.length) {
-        lines.push(`Упомянутые роли: ${roles.join(", ")}`);
+        lines.push(
+            `Упомянутые роли: ${roles.join(", ")}`
+        );
     }
 
     lines.push("Текст:");
     lines.push(
-        typeof m?.content === "string" && m.content.length
+        typeof m?.content === "string" &&
+        m.content.length
             ? m.content
             : "(без текста)"
     );
 
     lines.push(...attachmentLines(m));
-
-    const embeds = toArray(m?.embeds);
-    embeds.forEach((e, i) => {
-        lines.push(
-            `Embed ${i + 1}: ` +
-            [
-                e?.type ? `type=${e.type}` : null,
-                e?.title ? `title=${e.title}` : null,
-                e?.description ? `description=${e.description}` : null,
-                e?.url ? `url=${e.url}` : null
-            ].filter(Boolean).join(" | ")
-        );
-    });
-
-    const stickers = toArray(m?.sticker_items ?? m?.stickerItems ?? m?.stickers);
-    stickers.forEach(s => {
-        lines.push(
-            `Стикер: ${s?.name ?? "unknown"} | ` +
-            `id=${s?.id ?? "unknown"} | ` +
-            `format=${s?.format_type ?? s?.formatType ?? "unknown"}`
-        );
-    });
-
-    const reactions = toArray(m?.reactions);
-    if (reactions.length) {
-        lines.push(
-            `Реакции: ${reactions.map(r =>
-                `${r?.emoji?.name ?? r?.emoji?.id ?? "?"} x${r?.count ?? 0}`
-            ).join(", ")}`
-        );
-    }
 
     return lines.join("\n");
 }
@@ -507,20 +1011,29 @@ function sortMessages(messages) {
         const at = Date.parse(a?.timestamp ?? "");
         const bt = Date.parse(b?.timestamp ?? "");
 
-        if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) {
+        if (
+            Number.isFinite(at) &&
+            Number.isFinite(bt) &&
+            at !== bt
+        ) {
             return at - bt;
         }
 
         const ai = String(a?.id ?? "");
         const bi = String(b?.id ?? "");
 
-        if (ai.length !== bi.length) return ai.length - bi.length;
+        if (ai.length !== bi.length) {
+            return ai.length - bi.length;
+        }
+
         return ai.localeCompare(bi);
     });
 }
 
 function copySelected() {
-    const messages = sortMessages(Array.from(selected.values()));
+    const messages = sortMessages(
+        Array.from(selected.values())
+    );
 
     if (!messages.length) {
         toast("Нет выбранных сообщений");
@@ -530,12 +1043,53 @@ function copySelected() {
     clipboard.setString(
         messages
             .map(messageToText)
-            .join("\n\n====================\n\n")
+            .join(
+                "\n\n====================\n\n"
+            )
     );
 
     const count = messages.length;
+
+    debug("selection.copy", {
+        count
+    });
+
     cancelSelection(false);
     toast(`Скопировано сообщений: ${count}`);
+}
+
+function copyDebug() {
+    const header = [
+        `Telegram Selection DEBUG v${BUILD}`,
+        `selectionMode=${selectionMode}`,
+        `selected=${selected.size}`,
+        `selectionChannelId=${selectionChannelId ?? ""}`,
+        `jsxHookCount=${jsxHookCount}`,
+        `tapPropSeenCount=${tapPropSeenCount}`,
+        `tapCallCount=${tapCallCount}`,
+        `MessageStore=${Boolean(MessageStore)}`,
+        `LazyActionSheet=${Boolean(LazyActionSheet)}`,
+        `findByPropsAll=${typeof findByPropsAll}`,
+        `findAll=${typeof findAll}`,
+        ""
+    ];
+
+    const text =
+        header.join("\n") +
+        debugLog.join("\n");
+
+    clipboard.setString(text);
+    toast(`Debug скопирован: ${debugLog.length} строк`);
+}
+
+function clearDebug() {
+    debugLog.length = 0;
+
+    debug("debug.cleared", {
+        build: BUILD
+    });
+
+    toast("Debug очищен");
 }
 
 function makeRow(label, onPress) {
@@ -546,14 +1100,21 @@ function makeRow(label, onPress) {
 
     const source = icon();
 
-    if (ActionSheetRow?.Icon && source && React?.createElement) {
+    if (
+        ActionSheetRow?.Icon &&
+        source &&
+        React?.createElement
+    ) {
         props.icon = React.createElement(
             ActionSheetRow.Icon,
             { source }
         );
     }
 
-    return React.createElement(ActionSheetRow, props);
+    return React.createElement(
+        ActionSheetRow,
+        props
+    );
 }
 
 function injectRows(buttons, message) {
@@ -561,7 +1122,8 @@ function injectRows(buttons, message) {
 
     if (
         buttons.some(
-            row => row?.props?.__telegramSelectionRow
+            row =>
+                row?.props?.__telegramSelectionRow
         )
     ) {
         return;
@@ -586,7 +1148,8 @@ function injectRows(buttons, message) {
             )
         );
     } else {
-        const isSelected = selected.has(keyOf(message));
+        const isSelected =
+            selected.has(keyOf(message));
 
         rows.push(
             mark(
@@ -595,8 +1158,18 @@ function injectRows(buttons, message) {
                         ? "Убрать это сообщение из выбора"
                         : "Добавить это сообщение",
                     () => {
-                        setSelected(message, !isSelected, true);
-                        try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+                        setSelected(
+                            message,
+                            !isSelected,
+                            true,
+                            "long-press-menu"
+                        );
+
+                        try {
+                            LazyActionSheet
+                                ?.hideActionSheet
+                                ?.();
+                        } catch (_) {}
                     }
                 )
             )
@@ -623,11 +1196,38 @@ function injectRows(buttons, message) {
         );
     }
 
-    buttons.splice(0, 0, ...rows);
+    rows.push(
+        mark(
+            makeRow(
+                `Скопировать debug [v${BUILD}]`,
+                copyDebug
+            )
+        )
+    );
+
+    rows.push(
+        mark(
+            makeRow(
+                "Очистить debug",
+                clearDebug
+            )
+        )
+    );
+
+    buttons.splice(
+        0,
+        0,
+        ...rows
+    );
 }
 
 function patchActionSheet() {
-    if (!LazyActionSheet || actionSheetUnpatch) return;
+    if (
+        !LazyActionSheet ||
+        actionSheetUnpatch
+    ) {
+        return;
+    }
 
     actionSheetUnpatch = before(
         "openLazy",
@@ -643,7 +1243,12 @@ function patchActionSheet() {
                 return;
             }
 
-            suppressLongPress(message);
+            debug("longpress.open", {
+                messageId: message.id,
+                channelId: channelOf(message),
+                selectionMode,
+                selected: selected.size
+            });
 
             component.then(instance => {
                 const unpatch = after(
@@ -651,30 +1256,47 @@ function patchActionSheet() {
                     instance,
                     (_, result) => {
                         setTimeout(() => {
-                            try { unpatch(); } catch (_) {}
+                            try {
+                                unpatch();
+                            } catch (_) {}
                         }, 0);
 
-                        const buttons = findInReactTree(
-                            result,
-                            node =>
-                                Array.isArray(node) &&
-                                node.some?.(
-                                    item =>
-                                        item?.type?.name === "ActionSheetRow" ||
-                                        item?.props?.label
-                                )
+                        const buttons =
+                            findInReactTree(
+                                result,
+                                node =>
+                                    Array.isArray(node) &&
+                                    node.some?.(
+                                        item =>
+                                            item?.type
+                                                ?.name ===
+                                                "ActionSheetRow" ||
+                                            item?.props
+                                                ?.label
+                                    )
+                            );
+
+                        if (!buttons) {
+                            debug(
+                                "longpress.buttons-not-found"
+                            );
+                            return;
+                        }
+
+                        const channelId =
+                            channelOf(message);
+
+                        const current =
+                            getMessage(
+                                channelId,
+                                message.id,
+                                message
+                            );
+
+                        injectRows(
+                            buttons,
+                            current
                         );
-
-                        if (!buttons) return;
-
-                        const channelId = channelOf(message);
-                        const current = getMessage(
-                            channelId,
-                            message.id,
-                            message
-                        );
-
-                        injectRows(buttons, current);
                     }
                 );
             });
@@ -682,25 +1304,65 @@ function patchActionSheet() {
     );
 }
 
+function cleanup() {
+    for (const unpatch of jsxUnpatches) {
+        try {
+            unpatch?.();
+        } catch (_) {}
+    }
+
+    jsxUnpatches.length = 0;
+
+    for (const unpatch of miscUnpatches) {
+        try {
+            unpatch?.();
+        } catch (_) {}
+    }
+
+    miscUnpatches.length = 0;
+
+    try {
+        actionSheetUnpatch?.();
+    } catch (_) {}
+
+    actionSheetUnpatch = null;
+
+    cancelSelection(false);
+}
+
 const pluginDefinition = {
     onLoad() {
-        patchNativeEventDecoder();
+        debug("plugin.load", {
+            build: BUILD,
+            metroKeys: safeKeys(metro),
+            commonKeys: safeKeys(common),
+            MessageStore: Boolean(MessageStore),
+            LazyActionSheet: Boolean(LazyActionSheet)
+        });
+
+        installJsxHooks();
+        installDiagnosticHooks();
         patchActionSheet();
+
+        debug("plugin.ready", {
+            jsxHookCount,
+            miscHooks: miscUnpatches.length
+        });
     },
 
     onUnload() {
-        try { nativeEventUnpatch?.(); } catch (_) {}
-        nativeEventUnpatch = null;
-
-        try { actionSheetUnpatch?.(); } catch (_) {}
-        actionSheetUnpatch = null;
-
-        cancelSelection(false);
+        debug("plugin.unload");
+        cleanup();
     }
 };
 
 exports.default = pluginDefinition;
-Object.defineProperty(exports, "__esModule", { value: true });
+
+Object.defineProperty(
+    exports,
+    "__esModule",
+    { value: true }
+);
 
 return exports;
 
