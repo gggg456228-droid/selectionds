@@ -39,14 +39,16 @@ function getMessage(channelId, messageId, fallback) {
 }
 
 function messageKey(message) {
-    return `${message.channel_id}:${message.id}`;
+    return `${message.channel_id ?? message.channelId}:${message.id}`;
 }
 
 function paintMessage(message, value) {
-    if (!message?.id || !message?.channel_id || !FluxDispatcher?.dispatch) return;
+    const channelId = message?.channel_id ?? message?.channelId;
+    if (!message?.id || !channelId || !FluxDispatcher?.dispatch) return;
 
-    const key = messageKey(message);
-    const current = getMessage(message.channel_id, message.id, message) ?? message;
+    const normalized = { ...message, channel_id: channelId };
+    const key = messageKey(normalized);
+    const current = getMessage(channelId, message.id, normalized) ?? normalized;
 
     if (value) {
         if (!visualOriginals.has(key)) {
@@ -77,44 +79,54 @@ function paintMessage(message, value) {
     }
 }
 
-function setSelected(message, value) {
-    if (!message?.id || !message?.channel_id) return;
+function cleanSnapshot(message) {
+    const channelId = message?.channel_id ?? message?.channelId;
+    const key = `${channelId}:${message?.id}`;
+    return {
+        ...message,
+        channel_id: channelId,
+        content: visualOriginals.get(key) ?? message?.content
+    };
+}
 
-    if (!selectionChannelId) selectionChannelId = message.channel_id;
-    if (message.channel_id !== selectionChannelId) {
+function setSelected(message, value) {
+    const channelId = message?.channel_id ?? message?.channelId;
+    if (!message?.id || !channelId) return;
+
+    const normalized = { ...message, channel_id: channelId };
+
+    if (!selectionChannelId) selectionChannelId = channelId;
+    if (channelId !== selectionChannelId) {
         toast("Сначала закончи выбор в текущем чате");
         return;
     }
 
-    const key = messageKey(message);
+    const key = messageKey(normalized);
     if (value) {
-        const cleanMessage = {
-            ...message,
-            content: visualOriginals.get(key) ?? message.content
-        };
-        selected.set(key, cleanMessage);
-        paintMessage(message, true);
+        selected.set(key, cleanSnapshot(normalized));
+        paintMessage(normalized, true);
     } else {
         selected.delete(key);
-        paintMessage(message, false);
+        paintMessage(normalized, false);
     }
 
     toast(`Выбрано: ${selected.size}`);
 }
 
 function toggleSelected(message) {
-    if (!message?.id || !message?.channel_id) return;
-    const key = messageKey(message);
+    const channelId = message?.channel_id ?? message?.channelId;
+    if (!message?.id || !channelId) return;
+    const key = `${channelId}:${message.id}`;
     setSelected(message, !selected.has(key));
 }
 
 function beginSelection(message) {
-    selected.clear();
+    cancelSelection(false);
     selectionMode = true;
-    selectionChannelId = message.channel_id;
+    selectionChannelId = message?.channel_id ?? message?.channelId;
     setSelected(message, true);
     LazyActionSheet?.hideActionSheet?.();
-    toast("Режим выбора включён. Нажимай на другие сообщения");
+    toast("Режим выбора включён. Теперь просто нажимай на другие сообщения");
 }
 
 function cancelSelection(show = true) {
@@ -129,30 +141,157 @@ function cancelSelection(show = true) {
     if (show) toast("Выбор отменён");
 }
 
-function attachmentUrls(message) {
-    const attachments = message?.attachments;
-    if (!attachments) return [];
+function toArray(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value.toArray === "function") return value.toArray();
+    if (typeof value.values === "function") return Array.from(value.values());
+    if (typeof value === "object") return Object.values(value);
+    return [];
+}
 
-    const list = Array.isArray(attachments)
-        ? attachments
-        : typeof attachments?.toArray === "function"
-            ? attachments.toArray()
-            : typeof attachments?.values === "function"
-                ? Array.from(attachments.values())
-                : Object.values(attachments);
+function formatTime(timestamp) {
+    if (!timestamp) return "неизвестно";
+    try {
+        const d = new Date(timestamp);
+        if (Number.isNaN(d.getTime())) return String(timestamp);
+        const pad = n => String(n).padStart(2, "0");
+        const local =
+            `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ` +
+            `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        return `${local} | ${d.toISOString()}`;
+    } catch (_) {
+        return String(timestamp);
+    }
+}
 
-    return list
-        .map(a => a?.url ?? a?.proxy_url)
-        .filter(Boolean);
+function authorInfo(message) {
+    const a = message?.author ?? {};
+    const username = a.username ?? a.name ?? "unknown";
+    const globalName = a.global_name ?? a.globalName ?? a.displayName ?? null;
+    const discriminator = a.discriminator && a.discriminator !== "0" ? `#${a.discriminator}` : "";
+    const display = globalName ? `${globalName} (@${username}${discriminator})` : `@${username}${discriminator}`;
+    return {
+        display,
+        id: a.id ?? "unknown",
+        bot: Boolean(a.bot),
+        system: Boolean(a.system)
+    };
+}
+
+function attachmentLines(message) {
+    const list = toArray(message?.attachments);
+    if (!list.length) return [];
+    const lines = ["Вложения:"];
+    for (const a of list) {
+        const name = a?.filename ?? a?.name ?? "file";
+        const url = a?.url ?? a?.proxy_url ?? a?.proxyURL ?? "";
+        const type = a?.content_type ?? a?.contentType ?? "";
+        const size = a?.size != null ? `${a.size} bytes` : "";
+        const dims = a?.width && a?.height ? `${a.width}x${a.height}` : "";
+        const meta = [type, size, dims].filter(Boolean).join(", ");
+        lines.push(`  ${name}${meta ? ` (${meta})` : ""}${url ? `\n  ${url}` : ""}`);
+    }
+    return lines;
+}
+
+function embedLines(message) {
+    const embeds = toArray(message?.embeds);
+    if (!embeds.length) return [];
+    const lines = ["Embeds:"];
+    embeds.forEach((e, i) => {
+        const bits = [
+            e?.type ? `type=${e.type}` : null,
+            e?.title ? `title=${e.title}` : null,
+            e?.description ? `description=${e.description}` : null,
+            e?.url ? `url=${e.url}` : null
+        ].filter(Boolean);
+        lines.push(`  ${i + 1}. ${bits.join(" | ") || "embed"}`);
+    });
+    return lines;
+}
+
+function reactionLines(message) {
+    const reactions = toArray(message?.reactions);
+    if (!reactions.length) return [];
+    const parts = reactions.map(r => {
+        const emoji = r?.emoji?.name ?? r?.emoji?.id ?? "?";
+        const count = r?.count ?? 0;
+        return `${emoji} x${count}`;
+    });
+    return [`Реакции: ${parts.join(", ")}`];
+}
+
+function stickerLines(message) {
+    const stickers = toArray(message?.sticker_items ?? message?.stickerItems ?? message?.stickers);
+    if (!stickers.length) return [];
+    return stickers.map(s => `Стикер: ${s?.name ?? "unknown"} | id=${s?.id ?? "unknown"} | format=${s?.format_type ?? s?.formatType ?? "unknown"}`);
+}
+
+function replyLines(message) {
+    const ref = message?.message_reference ?? message?.messageReference;
+    const referenced = message?.referenced_message ?? message?.referencedMessage;
+    if (!ref && !referenced) return [];
+
+    const lines = [];
+    if (ref) {
+        lines.push(
+            `Ответ на: message_id=${ref.message_id ?? ref.messageId ?? "unknown"} | ` +
+            `channel_id=${ref.channel_id ?? ref.channelId ?? "unknown"} | ` +
+            `guild_id=${ref.guild_id ?? ref.guildId ?? "unknown"}`
+        );
+    }
+
+    if (referenced) {
+        const a = authorInfo(referenced);
+        lines.push(`Цитируемый автор: ${a.display} | author_id=${a.id}`);
+        if (referenced.content) lines.push(`Цитируемый текст: ${referenced.content}`);
+    }
+    return lines;
 }
 
 function messageToText(message) {
-    const parts = [];
-    if (typeof message?.content === "string" && message.content.length) {
-        parts.push(message.content);
+    const m = cleanSnapshot(message);
+    const author = authorInfo(m);
+    const channelId = m?.channel_id ?? m?.channelId ?? "unknown";
+    const guildId = m?.guild_id ?? m?.guildId ?? "unknown";
+    const timestamp = m?.timestamp ?? m?.created_at ?? m?.createdAt;
+    const edited = m?.edited_timestamp ?? m?.editedTimestamp;
+    const type = m?.type ?? "unknown";
+    const flags = m?.flags ?? 0;
+
+    const lines = [
+        `Время: ${formatTime(timestamp)}`,
+        `Автор: ${author.display}`,
+        `author_id: ${author.id}`,
+        `message_id: ${m?.id ?? "unknown"}`,
+        `channel_id: ${channelId}`,
+        `guild_id: ${guildId}`,
+        `type: ${type}`,
+        `flags: ${flags}`,
+        `bot: ${author.bot}`,
+        `system: ${author.system}`
+    ];
+
+    if (edited) lines.push(`Изменено: ${formatTime(edited)}`);
+    lines.push(...replyLines(m));
+
+    const mentions = toArray(m?.mentions);
+    if (mentions.length) {
+        lines.push(`Упоминания: ${mentions.map(u => `${u?.username ?? u?.global_name ?? "user"}(${u?.id ?? "?"})`).join(", ")}`);
     }
-    parts.push(...attachmentUrls(message));
-    return parts.join("\n");
+
+    const roleMentions = toArray(m?.mention_roles ?? m?.mentionRoles);
+    if (roleMentions.length) lines.push(`Упомянутые роли: ${roleMentions.join(", ")}`);
+
+    lines.push("Текст:");
+    lines.push(typeof m?.content === "string" && m.content.length ? m.content : "(без текста)");
+    lines.push(...attachmentLines(m));
+    lines.push(...embedLines(m));
+    lines.push(...stickerLines(m));
+    lines.push(...reactionLines(m));
+
+    return lines.join("\n");
 }
 
 function sortMessages(messages) {
@@ -170,15 +309,14 @@ function sortMessages(messages) {
 
 function copySelected() {
     const messages = sortMessages(Array.from(selected.values()));
-    const text = messages
-        .map(messageToText)
-        .filter(Boolean)
-        .join("\n\n");
-
-    if (!text) {
-        toast("В выбранных сообщениях нет текста или файлов");
+    if (!messages.length) {
+        toast("Нет выбранных сообщений");
         return;
     }
+
+    const text = messages
+        .map(messageToText)
+        .join("\n\n====================\n\n");
 
     clipboard.setString(text);
     const count = messages.length;
@@ -215,7 +353,7 @@ function injectSelectionActions(buttons, message) {
         const isSelected = selected.has(key);
 
         rows.push(mark(makeRow(
-            isSelected ? "Убрать из выбранного" : "Добавить в выбранное",
+            isSelected ? "Убрать это сообщение из выбора" : "Добавить это сообщение",
             () => {
                 toggleSelected(message);
                 LazyActionSheet?.hideActionSheet?.();
@@ -226,7 +364,7 @@ function injectSelectionActions(buttons, message) {
             rows.push(mark(makeRow(`Скопировать выбранные (${selected.size})`, copySelected)));
         }
 
-        rows.push(mark(makeRow("Отменить выбор", () => cancelSelection(true))));
+        rows.push(mark(makeRow("Отменить весь выбор", () => cancelSelection(true))));
     }
 
     buttons.splice(0, 0, ...rows);
@@ -241,15 +379,34 @@ function patchMessageTapHandlers(handlers) {
         const unpatch = instead("handleTapMessage", handlers, (args, original) => {
             if (!selectionMode) return original.apply(handlers, args);
 
-            const nativeEvent = args?.[0]?.nativeEvent;
-            const channelId = nativeEvent?.channelId;
-            const messageId = nativeEvent?.messageId;
-            if (!channelId || !messageId) return;
+            try {
+                const payload = args?.[0];
+                const nativeEvent = payload?.nativeEvent ?? payload;
+                const channelId =
+                    nativeEvent?.channelId ??
+                    nativeEvent?.channel_id ??
+                    payload?.message?.channel_id ??
+                    payload?.message?.channelId ??
+                    selectionChannelId;
+                const messageId =
+                    nativeEvent?.messageId ??
+                    nativeEvent?.message_id ??
+                    payload?.message?.id;
 
-            const message = getMessage(channelId, messageId);
-            if (!message) return;
+                if (!channelId || !messageId) {
+                    return original.apply(handlers, args);
+                }
 
-            toggleSelected(message);
+                const message = getMessage(channelId, messageId, payload?.message);
+                if (!message) {
+                    return original.apply(handlers, args);
+                }
+
+                toggleSelected({ ...message, channel_id: channelId });
+                return;
+            } catch (_) {
+                return original.apply(handlers, args);
+            }
         });
         handlerPatches.push(unpatch);
     }
@@ -271,7 +428,7 @@ const pluginDefinition = {
                     );
 
                     if (!buttons) return;
-                    const current = getMessage(message.channel_id, message.id, message);
+                    const current = getMessage(message.channel_id ?? message.channelId, message.id, message);
                     injectSelectionActions(buttons, current);
                 });
             });
@@ -326,6 +483,7 @@ const pluginDefinition = {
         cancelSelection(false);
     }
 };
+
 exports.default = pluginDefinition;
 Object.defineProperty(exports, "__esModule", { value: true });
 return exports;
