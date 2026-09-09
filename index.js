@@ -9,157 +9,293 @@ const { Forms } = components;
 const { showToast } = toasts;
 const { findInReactTree } = utils;
 
+const BUILD = "0.5.0";
+const BLUE_MARKER = "🔵 ";
+
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
 const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
 const MessageStore = findByStoreName("MessageStore");
+const NativeEventUtils = findByProps("getNativeSyntheticEventData");
 
 const selected = new Map();
-const visualOriginals = new Map();
-const patchedHandlers = new Set();
+const originals = new Map();
+const patchedTargets = new Set();
+const getterRestorers = [];
 
-const BLUE_MARKER = "🔵 ";
-
+let actionSheetUnpatch = null;
 let selectionMode = false;
 let selectionChannelId = null;
-let actionSheetUnpatches = [];
-let handlerUnpatches = [];
-let getterRestorers = [];
-let hookedPrototype = null;
+let lastTapKey = "";
+let lastTapAt = 0;
+let tapPatchCount = 0;
 
-const copyIcon = () => getAssetIDByName("ic_message_copy");
-
-function toast(text) {
-    try {
-        showToast(text, copyIcon());
-    } catch (_) {
-        try { showToast(text); } catch (_) {}
-    }
+function icon() {
+    try { return getAssetIDByName("ic_message_copy"); } catch (_) { return undefined; }
 }
 
-function getMessage(channelId, messageId, fallback) {
-    return MessageStore?.getMessage?.(channelId, messageId) ?? fallback ?? null;
+function toast(text) {
+    try { showToast(text, icon()); }
+    catch (_) { try { showToast(text); } catch (_) {} }
 }
 
 function channelOf(message) {
     return message?.channel_id ?? message?.channelId ?? null;
 }
 
-function messageKey(message) {
+function keyOf(message) {
     return `${channelOf(message)}:${message?.id}`;
 }
 
-function cleanSnapshot(message) {
-    const channelId = channelOf(message);
-    const key = `${channelId}:${message?.id}`;
-    return {
-        ...message,
-        channel_id: channelId,
-        content: visualOriginals.get(key) ?? message?.content ?? ""
-    };
+function getMessage(channelId, messageId, fallback) {
+    try {
+        return MessageStore?.getMessage?.(channelId, messageId) ?? fallback ?? null;
+    } catch (_) {
+        return fallback ?? null;
+    }
 }
 
-function paintMessage(message, enabled) {
+function cleanMessage(message) {
+    const channelId = channelOf(message);
+    const key = `${channelId}:${message?.id}`;
+    const original = originals.get(key);
+    let content = original ?? message?.content ?? "";
+    if (typeof content === "string" && content.startsWith(BLUE_MARKER)) {
+        content = content.slice(BLUE_MARKER.length);
+    }
+    return { ...message, channel_id: channelId, content };
+}
+
+function paint(message, enabled) {
     const channelId = channelOf(message);
     if (!message?.id || !channelId || !FluxDispatcher?.dispatch) return;
 
-    const normalized = { ...message, channel_id: channelId };
-    const key = messageKey(normalized);
-    const current = getMessage(channelId, message.id, normalized) ?? normalized;
+    const key = `${channelId}:${message.id}`;
+    const current = getMessage(channelId, message.id, message) ?? message;
 
     if (enabled) {
-        if (!visualOriginals.has(key)) {
-            let original = typeof current.content === "string" ? current.content : "";
-            if (original.startsWith(BLUE_MARKER)) original = original.slice(BLUE_MARKER.length);
-            visualOriginals.set(key, original);
+        if (!originals.has(key)) {
+            let content = typeof current.content === "string" ? current.content : "";
+            if (content.startsWith(BLUE_MARKER)) content = content.slice(BLUE_MARKER.length);
+            originals.set(key, content);
         }
-
-        const original = visualOriginals.get(key) ?? "";
         FluxDispatcher.dispatch({
             type: "MESSAGE_UPDATE",
             message: {
                 ...current,
-                content: `${BLUE_MARKER}${original}`,
+                content: BLUE_MARKER + (originals.get(key) ?? ""),
                 __telegramSelectionVisual: true
             },
             otherPluginBypass: true
         });
-        return;
+    } else if (originals.has(key)) {
+        FluxDispatcher.dispatch({
+            type: "MESSAGE_UPDATE",
+            message: {
+                ...current,
+                content: originals.get(key) ?? "",
+                __telegramSelectionVisual: undefined
+            },
+            otherPluginBypass: true
+        });
+        originals.delete(key);
     }
-
-    if (!visualOriginals.has(key)) return;
-
-    const original = visualOriginals.get(key) ?? "";
-    FluxDispatcher.dispatch({
-        type: "MESSAGE_UPDATE",
-        message: {
-            ...current,
-            content: original,
-            __telegramSelectionVisual: undefined
-        },
-        otherPluginBypass: true
-    });
-    visualOriginals.delete(key);
 }
 
 function setSelected(message, enabled) {
     const channelId = channelOf(message);
     if (!message?.id || !channelId) return;
 
-    const normalized = { ...message, channel_id: channelId };
-
     if (!selectionChannelId) selectionChannelId = channelId;
     if (channelId !== selectionChannelId) {
-        toast("Сначала закончи выбор в текущем чате");
+        toast("Выбор работает только в текущем чате");
         return;
     }
 
-    const key = messageKey(normalized);
+    const normalized = { ...message, channel_id: channelId };
+    const key = keyOf(normalized);
 
     if (enabled) {
-        selected.set(key, cleanSnapshot(normalized));
-        paintMessage(normalized, true);
+        selected.set(key, cleanMessage(normalized));
+        paint(normalized, true);
     } else {
         selected.delete(key);
-        paintMessage(normalized, false);
+        paint(normalized, false);
     }
 
     toast(`Выбрано: ${selected.size}`);
 }
 
 function toggleSelected(message) {
-    const channelId = channelOf(message);
-    if (!message?.id || !channelId) return;
-
-    const key = `${channelId}:${message.id}`;
+    const key = keyOf(message);
     setSelected(message, !selected.has(key));
 }
 
-function cancelSelection(showToast = true) {
+function cancelSelection(show = true) {
     for (const message of selected.values()) {
-        try { paintMessage(message, false); } catch (_) {}
+        try { paint(message, false); } catch (_) {}
     }
 
     selected.clear();
-    visualOriginals.clear();
+    originals.clear();
     selectionMode = false;
     selectionChannelId = null;
+    lastTapKey = "";
+    lastTapAt = 0;
 
     try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+    if (show) toast("Выбор отменён");
+}
 
-    if (showToast) toast("Выбор отменён");
+function decodeTap(args) {
+    const payload = args?.[0];
+    const candidates = [];
+
+    try {
+        const decoded = NativeEventUtils?.getNativeSyntheticEventData?.(payload);
+        if (decoded) candidates.push(decoded);
+    } catch (_) {}
+
+    try {
+        if (payload?.nativeEvent) candidates.push(payload.nativeEvent);
+    } catch (_) {}
+
+    if (payload) candidates.push(payload);
+
+    for (const data of candidates) {
+        const messageId =
+            data?.messageId ??
+            data?.message_id ??
+            data?.id ??
+            data?.message?.id;
+
+        const channelId =
+            data?.channelId ??
+            data?.channel_id ??
+            data?.message?.channel_id ??
+            data?.message?.channelId ??
+            selectionChannelId;
+
+        if (messageId && channelId) {
+            return { messageId: String(messageId), channelId: String(channelId), fallback: data?.message };
+        }
+    }
+
+    return null;
+}
+
+function onMessageTap(args) {
+    if (!selectionMode) return;
+
+    const info = decodeTap(args);
+    if (!info) return;
+
+    const dedupeKey = `${info.channelId}:${info.messageId}`;
+    const now = Date.now();
+    if (dedupeKey === lastTapKey && now - lastTapAt < 120) return;
+    lastTapKey = dedupeKey;
+    lastTapAt = now;
+
+    const message = getMessage(info.channelId, info.messageId, info.fallback);
+    if (!message) {
+        toast(`Не нашёл сообщение ${info.messageId}`);
+        return;
+    }
+
+    toggleSelected({ ...message, channel_id: info.channelId });
+}
+
+function patchTapTarget(target) {
+    if (!target || (typeof target !== "object" && typeof target !== "function")) return false;
+    if (patchedTargets.has(target)) return true;
+    if (typeof target.handleTapMessage !== "function") return false;
+
+    try {
+        const unpatch = after("handleTapMessage", target, args => onMessageTap(args));
+        patchedTargets.add(target);
+        tapPatchCount++;
+        target.__telegramSelectionUnpatch = unpatch;
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function scanTarget(target, depth = 1) {
+    if (!target || depth < 0) return;
+    patchTapTarget(target);
+
+    if (depth === 0 || (typeof target !== "object" && typeof target !== "function")) return;
+
+    const keys = ["default", "handlers", "params", "_params", "messageHandlers", "MessagesHandlers"];
+    for (const key of keys) {
+        try {
+            const value = target[key];
+            if (value && value !== target) scanTarget(value, depth - 1);
+        } catch (_) {}
+    }
+}
+
+function hookGetter(prototype, name) {
+    let descriptor;
+    try { descriptor = Object.getOwnPropertyDescriptor(prototype, name); } catch (_) { return; }
+    if (!descriptor?.get || descriptor.configurable === false) return;
+    if (descriptor.get.__telegramSelectionWrapped) return;
+
+    const originalGetter = descriptor.get;
+
+    function wrappedGetter() {
+        const value = originalGetter.call(this);
+        try { scanTarget(this, 1); } catch (_) {}
+        try { scanTarget(value, 2); } catch (_) {}
+        return value;
+    }
+    wrappedGetter.__telegramSelectionWrapped = true;
+
+    try {
+        Object.defineProperty(prototype, name, {
+            ...descriptor,
+            get: wrappedGetter
+        });
+
+        getterRestorers.push(() => {
+            try { Object.defineProperty(prototype, name, descriptor); } catch (_) {}
+        });
+    } catch (_) {}
+}
+
+function ensureTapHooks() {
+    try {
+        scanTarget(findByProps("handleTapMessage"), 2);
+    } catch (_) {}
+
+    try {
+        const module = findByProps("MessagesHandlers");
+        scanTarget(module, 2);
+
+        const MessagesHandlers = module?.MessagesHandlers;
+        const prototype = MessagesHandlers?.prototype;
+
+        if (prototype) {
+            scanTarget(prototype, 1);
+            for (const name of ["params", "handlers", "_params", "messageHandlers"]) {
+                hookGetter(prototype, name);
+            }
+        }
+    } catch (_) {}
+
+    return tapPatchCount;
 }
 
 function beginSelection(message) {
     cancelSelection(false);
-
     selectionMode = true;
     selectionChannelId = channelOf(message);
 
-    ensureTapHooks();
+    const count = ensureTapHooks();
     setSelected(message, true);
 
     try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
-    toast("Режим выбора включён. Нажимай на другие сообщения");
+    toast(`Выбор включён. Tap hooks: ${count}`);
 }
 
 function toArray(value) {
@@ -173,198 +309,111 @@ function toArray(value) {
 
 function formatTime(timestamp) {
     if (!timestamp) return "неизвестно";
-
     try {
         const d = new Date(timestamp);
         if (Number.isNaN(d.getTime())) return String(timestamp);
-
-        const pad = n => String(n).padStart(2, "0");
-        const local =
-            `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ` +
-            `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
-        return `${local} | ${d.toISOString()}`;
+        const p = n => String(n).padStart(2, "0");
+        return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} | ${d.toISOString()}`;
     } catch (_) {
         return String(timestamp);
     }
 }
 
 function authorInfo(message) {
-    const author = message?.author ?? {};
-    const username = author.username ?? author.name ?? "unknown";
-    const globalName = author.global_name ?? author.globalName ?? author.displayName ?? null;
-    const discriminator =
-        author.discriminator && author.discriminator !== "0"
-            ? `#${author.discriminator}`
-            : "";
-
+    const a = message?.author ?? {};
+    const username = a.username ?? a.name ?? "unknown";
+    const globalName = a.global_name ?? a.globalName ?? a.displayName ?? "";
+    const discriminator = a.discriminator && a.discriminator !== "0" ? `#${a.discriminator}` : "";
     return {
-        display: globalName
-            ? `${globalName} (@${username}${discriminator})`
-            : `@${username}${discriminator}`,
+        display: globalName ? `${globalName} (@${username}${discriminator})` : `@${username}${discriminator}`,
         username,
         globalName,
-        id: author.id ?? "unknown",
-        bot: Boolean(author.bot),
-        system: Boolean(author.system)
+        id: a.id ?? "unknown",
+        bot: Boolean(a.bot),
+        system: Boolean(a.system)
     };
 }
 
 function attachmentLines(message) {
-    const attachments = toArray(message?.attachments);
-    if (!attachments.length) return [];
+    const list = toArray(message?.attachments);
+    if (!list.length) return [];
 
     const lines = ["Вложения:"];
-
-    attachments.forEach((attachment, index) => {
-        const name = attachment?.filename ?? attachment?.name ?? "file";
-        const url = attachment?.url ?? attachment?.proxy_url ?? attachment?.proxyURL ?? "";
-        const type = attachment?.content_type ?? attachment?.contentType ?? "";
-        const size = attachment?.size ?? "";
-        const width = attachment?.width ?? "";
-        const height = attachment?.height ?? "";
-
+    list.forEach((a, i) => {
+        const url = a?.url ?? a?.proxy_url ?? a?.proxyURL ?? "";
         lines.push(
-            `${index + 1}. ${name}` +
-            `${type ? ` | type=${type}` : ""}` +
-            `${size !== "" ? ` | size=${size}` : ""}` +
-            `${width && height ? ` | ${width}x${height}` : ""}` +
+            `${i + 1}. ${a?.filename ?? a?.name ?? "file"}` +
+            `${a?.content_type ?? a?.contentType ? ` | type=${a.content_type ?? a.contentType}` : ""}` +
+            `${a?.size != null ? ` | size=${a.size}` : ""}` +
+            `${a?.width && a?.height ? ` | ${a.width}x${a.height}` : ""}` +
             `${url ? `\n${url}` : ""}`
         );
     });
-
     return lines;
-}
-
-function embedLines(message) {
-    const embeds = toArray(message?.embeds);
-    if (!embeds.length) return [];
-
-    const lines = ["Embeds:"];
-
-    embeds.forEach((embed, index) => {
-        lines.push(
-            `${index + 1}. ` +
-            [
-                embed?.type ? `type=${embed.type}` : null,
-                embed?.title ? `title=${embed.title}` : null,
-                embed?.description ? `description=${embed.description}` : null,
-                embed?.url ? `url=${embed.url}` : null
-            ].filter(Boolean).join(" | ")
-        );
-    });
-
-    return lines;
-}
-
-function reactionLines(message) {
-    const reactions = toArray(message?.reactions);
-    if (!reactions.length) return [];
-
-    return [
-        "Реакции: " +
-        reactions.map(reaction => {
-            const emoji = reaction?.emoji?.name ?? reaction?.emoji?.id ?? "?";
-            return `${emoji} x${reaction?.count ?? 0}`;
-        }).join(", ")
-    ];
-}
-
-function stickerLines(message) {
-    const stickers = toArray(
-        message?.sticker_items ??
-        message?.stickerItems ??
-        message?.stickers
-    );
-
-    return stickers.map(sticker =>
-        `Стикер: ${sticker?.name ?? "unknown"} | ` +
-        `id=${sticker?.id ?? "unknown"} | ` +
-        `format=${sticker?.format_type ?? sticker?.formatType ?? "unknown"}`
-    );
 }
 
 function replyLines(message) {
-    const reference = message?.message_reference ?? message?.messageReference;
-    const referenced = message?.referenced_message ?? message?.referencedMessage;
-
-    if (!reference && !referenced) return [];
-
+    const ref = message?.message_reference ?? message?.messageReference;
+    const quoted = message?.referenced_message ?? message?.referencedMessage;
     const lines = [];
 
-    if (reference) {
+    if (ref) {
         lines.push(
-            "Ответ на: " +
-            `message_id=${reference.message_id ?? reference.messageId ?? "unknown"} | ` +
-            `channel_id=${reference.channel_id ?? reference.channelId ?? "unknown"} | ` +
-            `guild_id=${reference.guild_id ?? reference.guildId ?? "unknown"}`
+            `Ответ на: message_id=${ref.message_id ?? ref.messageId ?? "unknown"} | ` +
+            `channel_id=${ref.channel_id ?? ref.channelId ?? "unknown"} | ` +
+            `guild_id=${ref.guild_id ?? ref.guildId ?? "unknown"}`
         );
     }
 
-    if (referenced) {
-        const author = authorInfo(referenced);
-        lines.push(`Цитируемый автор: ${author.display} | author_id=${author.id}`);
-
-        if (referenced.content) {
-            lines.push(`Цитируемый текст: ${referenced.content}`);
-        }
+    if (quoted) {
+        const a = authorInfo(quoted);
+        lines.push(`Цитируемый автор: ${a.display} | author_id=${a.id}`);
+        if (quoted.content) lines.push(`Цитируемый текст: ${quoted.content}`);
     }
 
     return lines;
 }
 
 function messageToText(message) {
-    const m = cleanSnapshot(message);
-    const author = authorInfo(m);
-
+    const m = cleanMessage(message);
+    const a = authorInfo(m);
     const timestamp = m?.timestamp ?? m?.created_at ?? m?.createdAt;
     const edited = m?.edited_timestamp ?? m?.editedTimestamp;
 
     const lines = [
         `Время: ${formatTime(timestamp)}`,
-        `Автор: ${author.display}`,
-        `username: ${author.username}`,
-        `global_name: ${author.globalName ?? ""}`,
-        `author_id: ${author.id}`,
+        `Автор: ${a.display}`,
+        `username: ${a.username}`,
+        `global_name: ${a.globalName}`,
+        `author_id: ${a.id}`,
         `message_id: ${m?.id ?? "unknown"}`,
         `channel_id: ${channelOf(m) ?? "unknown"}`,
         `guild_id: ${m?.guild_id ?? m?.guildId ?? "unknown"}`,
         `type: ${m?.type ?? "unknown"}`,
         `flags: ${m?.flags ?? 0}`,
-        `bot: ${author.bot}`,
-        `system: ${author.system}`
+        `bot: ${a.bot}`,
+        `system: ${a.system}`
     ];
 
     if (edited) lines.push(`Изменено: ${formatTime(edited)}`);
-
     lines.push(...replyLines(m));
 
     const mentions = toArray(m?.mentions);
     if (mentions.length) {
-        lines.push(
-            "Упоминания: " +
-            mentions.map(user =>
-                `${user?.username ?? user?.global_name ?? "user"}(${user?.id ?? "?"})`
-            ).join(", ")
-        );
-    }
-
-    const roles = toArray(m?.mention_roles ?? m?.mentionRoles);
-    if (roles.length) {
-        lines.push(`Упомянутые роли: ${roles.join(", ")}`);
+        lines.push(`Упоминания: ${mentions.map(u => `${u?.username ?? u?.global_name ?? "user"}(${u?.id ?? "?"})`).join(", ")}`);
     }
 
     lines.push("Текст:");
-    lines.push(
-        typeof m?.content === "string" && m.content.length
-            ? m.content
-            : "(без текста)"
-    );
-
+    lines.push(typeof m?.content === "string" && m.content.length ? m.content : "(без текста)");
     lines.push(...attachmentLines(m));
-    lines.push(...embedLines(m));
-    lines.push(...stickerLines(m));
-    lines.push(...reactionLines(m));
+
+    const stickers = toArray(m?.sticker_items ?? m?.stickerItems ?? m?.stickers);
+    stickers.forEach(s => lines.push(`Стикер: ${s?.name ?? "unknown"} | id=${s?.id ?? "unknown"}`));
+
+    const reactions = toArray(m?.reactions);
+    if (reactions.length) {
+        lines.push(`Реакции: ${reactions.map(r => `${r?.emoji?.name ?? r?.emoji?.id ?? "?"} x${r?.count ?? 0}`).join(", ")}`);
+    }
 
     return lines.join("\n");
 }
@@ -373,14 +422,10 @@ function sortMessages(messages) {
     return messages.sort((a, b) => {
         const at = Date.parse(a?.timestamp ?? "");
         const bt = Date.parse(b?.timestamp ?? "");
-
-        if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) {
-            return at - bt;
-        }
+        if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt;
 
         const ai = String(a?.id ?? "");
         const bi = String(b?.id ?? "");
-
         if (ai.length !== bi.length) return ai.length - bi.length;
         return ai.localeCompare(bi);
     });
@@ -388,18 +433,12 @@ function sortMessages(messages) {
 
 function copySelected() {
     const messages = sortMessages(Array.from(selected.values()));
-
     if (!messages.length) {
         toast("Нет выбранных сообщений");
         return;
     }
 
-    const text = messages
-        .map(messageToText)
-        .join("\n\n====================\n\n");
-
-    clipboard.setString(text);
-
+    clipboard.setString(messages.map(messageToText).join("\n\n====================\n\n"));
     const count = messages.length;
     cancelSelection(false);
     toast(`Скопировано сообщений: ${count}`);
@@ -407,16 +446,16 @@ function copySelected() {
 
 function makeRow(label, onPress) {
     const props = { label, onPress };
-    const icon = copyIcon();
+    const source = icon();
 
-    if (ActionSheetRow?.Icon && icon && React?.createElement) {
-        props.icon = React.createElement(ActionSheetRow.Icon, { source: icon });
+    if (ActionSheetRow?.Icon && source && React?.createElement) {
+        props.icon = React.createElement(ActionSheetRow.Icon, { source });
     }
 
     return React.createElement(ActionSheetRow, props);
 }
 
-function injectSelectionActions(buttons, message) {
+function injectRows(buttons, message) {
     if (!Array.isArray(buttons)) return;
     if (buttons.some(row => row?.props?.__telegramSelectionRow)) return;
 
@@ -428,222 +467,67 @@ function injectSelectionActions(buttons, message) {
     const rows = [];
 
     if (!selectionMode) {
-        rows.push(
-            mark(
-                makeRow(
-                    "Выбрать сообщение",
-                    () => beginSelection(message)
-                )
-            )
-        );
+        rows.push(mark(makeRow(`Выбрать сообщение [v${BUILD}]`, () => beginSelection(message))));
     } else {
-        const isSelected = selected.has(messageKey(message));
+        const isSelected = selected.has(keyOf(message));
 
-        rows.push(
-            mark(
-                makeRow(
-                    isSelected
-                        ? "Убрать это сообщение из выбора"
-                        : "Добавить это сообщение",
-                    () => {
-                        toggleSelected(message);
-                        try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
-                    }
-                )
-            )
-        );
+        rows.push(mark(makeRow(
+            isSelected ? "Убрать это сообщение из выбора" : "Добавить это сообщение",
+            () => {
+                toggleSelected(message);
+                try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+            }
+        )));
 
-        if (selected.size > 0) {
-            rows.push(
-                mark(
-                    makeRow(
-                        `Скопировать выбранные (${selected.size})`,
-                        copySelected
-                    )
-                )
-            );
+        if (selected.size) {
+            rows.push(mark(makeRow(`Скопировать выбранные (${selected.size})`, copySelected)));
         }
 
-        rows.push(
-            mark(
-                makeRow(
-                    "Отменить весь выбор",
-                    () => cancelSelection(true)
-                )
-            )
-        );
+        rows.push(mark(makeRow("Отменить весь выбор", () => cancelSelection(true))));
     }
 
     buttons.splice(0, 0, ...rows);
 }
 
-function processTapArgs(args) {
-    if (!selectionMode) return;
-
-    try {
-        const payload = args?.[0];
-        const nativeEvent = payload?.nativeEvent ?? payload;
-
-        const channelId =
-            nativeEvent?.channelId ??
-            nativeEvent?.channel_id ??
-            payload?.message?.channel_id ??
-            payload?.message?.channelId ??
-            selectionChannelId;
-
-        const messageId =
-            nativeEvent?.messageId ??
-            nativeEvent?.message_id ??
-            payload?.message?.id;
-
-        if (!channelId || !messageId) return;
-
-        const message = getMessage(channelId, messageId, payload?.message);
-        if (!message) return;
-
-        toggleSelected({
-            ...message,
-            channel_id: channelId
-        });
-    } catch (_) {}
-}
-
-function patchMessageTapHandlers(handlers) {
-    if (!handlers || patchedHandlers.has(handlers)) return;
-    if (typeof handlers.handleTapMessage !== "function") return;
-
-    patchedHandlers.add(handlers);
-
-    try {
-        const unpatch = after(
-            "handleTapMessage",
-            handlers,
-            args => processTapArgs(args)
-        );
-
-        handlerUnpatches.push(unpatch);
-    } catch (_) {
-        patchedHandlers.delete(handlers);
-    }
-}
-
-function restoreTapHooks() {
-    handlerUnpatches.forEach(unpatch => {
-        try { unpatch(); } catch (_) {}
-    });
-    handlerUnpatches = [];
-
-    getterRestorers.forEach(restore => {
-        try { restore(); } catch (_) {}
-    });
-    getterRestorers = [];
-
-    patchedHandlers.clear();
-    hookedPrototype = null;
-}
-
-function ensureTapHooks() {
-    try {
-        const module = findByProps("MessagesHandlers");
-        const MessagesHandlers = module?.MessagesHandlers;
-        const prototype = MessagesHandlers?.prototype;
-
-        if (!prototype) return false;
-        if (hookedPrototype === prototype) return true;
-
-        restoreTapHooks();
-        hookedPrototype = prototype;
-
-        patchMessageTapHandlers(prototype);
-
-        const names = ["params", "handlers", "_params", "messageHandlers"];
-
-        for (const name of names) {
-            const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
-            const originalGetter = descriptor?.get;
-
-            if (!originalGetter) continue;
-
-            Object.defineProperty(prototype, name, {
-                ...descriptor,
-                configurable: true,
-                get() {
-                    const value = originalGetter.call(this);
-
-                    try { patchMessageTapHandlers(this); } catch (_) {}
-                    try { patchMessageTapHandlers(value); } catch (_) {}
-
-                    return value;
-                }
-            });
-
-            getterRestorers.push(() => {
-                try {
-                    Object.defineProperty(prototype, name, descriptor);
-                } catch (_) {}
-            });
-        }
-
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
-
 function patchActionSheet() {
     if (!LazyActionSheet) return;
 
-    const unpatch = before(
-        "openLazy",
-        LazyActionSheet,
-        ([component, key, msg]) => {
-            const message = msg?.message;
+    actionSheetUnpatch = before("openLazy", LazyActionSheet, ([component, key, msg]) => {
+        const message = msg?.message;
+        if (key !== "MessageLongPressActionSheet" || !message || !component?.then) return;
 
-            if (
-                key !== "MessageLongPressActionSheet" ||
-                !message ||
-                !component?.then
-            ) {
-                return;
-            }
+        component.then(instance => {
+            const unpatch = after("default", instance, (_, result) => {
+                setTimeout(() => { try { unpatch(); } catch (_) {} }, 0);
 
-            component.then(instance => {
-                const sheetUnpatch = after(
-                    "default",
-                    instance,
-                    (_, result) => {
-                        setTimeout(() => {
-                            try { sheetUnpatch(); } catch (_) {}
-                        }, 0);
-
-                        const buttons = findInReactTree(
-                            result,
-                            node =>
-                                Array.isArray(node) &&
-                                node.some?.(
-                                    item =>
-                                        item?.type?.name === "ActionSheetRow" ||
-                                        item?.props?.label
-                                )
-                        );
-
-                        if (!buttons) return;
-
-                        const channelId = channelOf(message);
-                        const current = getMessage(
-                            channelId,
-                            message.id,
-                            message
-                        );
-
-                        injectSelectionActions(buttons, current);
-                    }
+                const buttons = findInReactTree(
+                    result,
+                    node => Array.isArray(node) && node.some?.(
+                        item => item?.type?.name === "ActionSheetRow" || item?.props?.label
+                    )
                 );
-            });
-        }
-    );
 
-    actionSheetUnpatches.push(unpatch);
+                if (!buttons) return;
+
+                const channelId = channelOf(message);
+                injectRows(buttons, getMessage(channelId, message.id, message));
+            });
+        });
+    });
+}
+
+function cleanupTapHooks() {
+    for (const target of patchedTargets) {
+        try { target.__telegramSelectionUnpatch?.(); } catch (_) {}
+        try { delete target.__telegramSelectionUnpatch; } catch (_) {}
+    }
+    patchedTargets.clear();
+
+    while (getterRestorers.length) {
+        try { getterRestorers.pop()?.(); } catch (_) {}
+    }
+
+    tapPatchCount = 0;
 }
 
 const pluginDefinition = {
@@ -653,12 +537,9 @@ const pluginDefinition = {
     },
 
     onUnload() {
-        actionSheetUnpatches.forEach(unpatch => {
-            try { unpatch(); } catch (_) {}
-        });
-        actionSheetUnpatches = [];
-
-        restoreTapHooks();
+        try { actionSheetUnpatch?.(); } catch (_) {}
+        actionSheetUnpatch = null;
+        cleanupTapHooks();
         cancelSelection(false);
     }
 };
