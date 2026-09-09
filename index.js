@@ -1,8 +1,9 @@
 (function(exports, metro, common, patcher, assets, components, toasts, utils) {
 "use strict";
+
 const { findByProps, findByStoreName } = metro;
-const { clipboard, FluxDispatcher } = common;
-const { after, before, instead } = patcher;
+const { clipboard, FluxDispatcher, React } = common;
+const { after, before } = patcher;
 const { getAssetIDByName } = assets;
 const { Forms } = components;
 const { showToast } = toasts;
@@ -11,18 +12,19 @@ const { findInReactTree } = utils;
 const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
 const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
 const MessageStore = findByStoreName("MessageStore");
-const HandlersModule = findByProps("MessagesHandlers");
-const MessagesHandlers = HandlersModule?.MessagesHandlers;
 
 const selected = new Map();
 const visualOriginals = new Map();
+const patchedHandlers = new Set();
+
 const BLUE_MARKER = "🔵 ";
+
 let selectionMode = false;
 let selectionChannelId = null;
-let patches = [];
-let handlerPatches = [];
-const patchedHandlers = new Set();
-let unpatchGetter = null;
+let actionSheetUnpatches = [];
+let handlerUnpatches = [];
+let getterRestorers = [];
+let hookedPrototype = null;
 
 const copyIcon = () => getAssetIDByName("ic_message_copy");
 
@@ -30,7 +32,7 @@ function toast(text) {
     try {
         showToast(text, copyIcon());
     } catch (_) {
-        showToast(text);
+        try { showToast(text); } catch (_) {}
     }
 }
 
@@ -38,22 +40,39 @@ function getMessage(channelId, messageId, fallback) {
     return MessageStore?.getMessage?.(channelId, messageId) ?? fallback ?? null;
 }
 
-function messageKey(message) {
-    return `${message.channel_id ?? message.channelId}:${message.id}`;
+function channelOf(message) {
+    return message?.channel_id ?? message?.channelId ?? null;
 }
 
-function paintMessage(message, value) {
-    const channelId = message?.channel_id ?? message?.channelId;
+function messageKey(message) {
+    return `${channelOf(message)}:${message?.id}`;
+}
+
+function cleanSnapshot(message) {
+    const channelId = channelOf(message);
+    const key = `${channelId}:${message?.id}`;
+    return {
+        ...message,
+        channel_id: channelId,
+        content: visualOriginals.get(key) ?? message?.content ?? ""
+    };
+}
+
+function paintMessage(message, enabled) {
+    const channelId = channelOf(message);
     if (!message?.id || !channelId || !FluxDispatcher?.dispatch) return;
 
     const normalized = { ...message, channel_id: channelId };
     const key = messageKey(normalized);
     const current = getMessage(channelId, message.id, normalized) ?? normalized;
 
-    if (value) {
+    if (enabled) {
         if (!visualOriginals.has(key)) {
-            visualOriginals.set(key, typeof current.content === "string" ? current.content : "");
+            let original = typeof current.content === "string" ? current.content : "";
+            if (original.startsWith(BLUE_MARKER)) original = original.slice(BLUE_MARKER.length);
+            visualOriginals.set(key, original);
         }
+
         const original = visualOriginals.get(key) ?? "";
         FluxDispatcher.dispatch({
             type: "MESSAGE_UPDATE",
@@ -64,33 +83,26 @@ function paintMessage(message, value) {
             },
             otherPluginBypass: true
         });
-    } else if (visualOriginals.has(key)) {
-        const original = visualOriginals.get(key) ?? "";
-        FluxDispatcher.dispatch({
-            type: "MESSAGE_UPDATE",
-            message: {
-                ...current,
-                content: original,
-                __telegramSelectionVisual: undefined
-            },
-            otherPluginBypass: true
-        });
-        visualOriginals.delete(key);
+        return;
     }
+
+    if (!visualOriginals.has(key)) return;
+
+    const original = visualOriginals.get(key) ?? "";
+    FluxDispatcher.dispatch({
+        type: "MESSAGE_UPDATE",
+        message: {
+            ...current,
+            content: original,
+            __telegramSelectionVisual: undefined
+        },
+        otherPluginBypass: true
+    });
+    visualOriginals.delete(key);
 }
 
-function cleanSnapshot(message) {
-    const channelId = message?.channel_id ?? message?.channelId;
-    const key = `${channelId}:${message?.id}`;
-    return {
-        ...message,
-        channel_id: channelId,
-        content: visualOriginals.get(key) ?? message?.content
-    };
-}
-
-function setSelected(message, value) {
-    const channelId = message?.channel_id ?? message?.channelId;
+function setSelected(message, enabled) {
+    const channelId = channelOf(message);
     if (!message?.id || !channelId) return;
 
     const normalized = { ...message, channel_id: channelId };
@@ -102,7 +114,8 @@ function setSelected(message, value) {
     }
 
     const key = messageKey(normalized);
-    if (value) {
+
+    if (enabled) {
         selected.set(key, cleanSnapshot(normalized));
         paintMessage(normalized, true);
     } else {
@@ -114,31 +127,39 @@ function setSelected(message, value) {
 }
 
 function toggleSelected(message) {
-    const channelId = message?.channel_id ?? message?.channelId;
+    const channelId = channelOf(message);
     if (!message?.id || !channelId) return;
+
     const key = `${channelId}:${message.id}`;
     setSelected(message, !selected.has(key));
 }
 
-function beginSelection(message) {
-    cancelSelection(false);
-    selectionMode = true;
-    selectionChannelId = message?.channel_id ?? message?.channelId;
-    setSelected(message, true);
-    LazyActionSheet?.hideActionSheet?.();
-    toast("Режим выбора включён. Теперь просто нажимай на другие сообщения");
-}
-
-function cancelSelection(show = true) {
+function cancelSelection(showToast = true) {
     for (const message of selected.values()) {
         try { paintMessage(message, false); } catch (_) {}
     }
+
     selected.clear();
     visualOriginals.clear();
     selectionMode = false;
     selectionChannelId = null;
-    LazyActionSheet?.hideActionSheet?.();
-    if (show) toast("Выбор отменён");
+
+    try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+
+    if (showToast) toast("Выбор отменён");
+}
+
+function beginSelection(message) {
+    cancelSelection(false);
+
+    selectionMode = true;
+    selectionChannelId = channelOf(message);
+
+    ensureTapHooks();
+    setSelected(message, true);
+
+    try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+    toast("Режим выбора включён. Нажимай на другие сообщения");
 }
 
 function toArray(value) {
@@ -152,13 +173,16 @@ function toArray(value) {
 
 function formatTime(timestamp) {
     if (!timestamp) return "неизвестно";
+
     try {
         const d = new Date(timestamp);
         if (Number.isNaN(d.getTime())) return String(timestamp);
+
         const pad = n => String(n).padStart(2, "0");
         const local =
             `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ` +
             `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
         return `${local} | ${d.toISOString()}`;
     } catch (_) {
         return String(timestamp);
@@ -166,126 +190,177 @@ function formatTime(timestamp) {
 }
 
 function authorInfo(message) {
-    const a = message?.author ?? {};
-    const username = a.username ?? a.name ?? "unknown";
-    const globalName = a.global_name ?? a.globalName ?? a.displayName ?? null;
-    const discriminator = a.discriminator && a.discriminator !== "0" ? `#${a.discriminator}` : "";
-    const display = globalName ? `${globalName} (@${username}${discriminator})` : `@${username}${discriminator}`;
+    const author = message?.author ?? {};
+    const username = author.username ?? author.name ?? "unknown";
+    const globalName = author.global_name ?? author.globalName ?? author.displayName ?? null;
+    const discriminator =
+        author.discriminator && author.discriminator !== "0"
+            ? `#${author.discriminator}`
+            : "";
+
     return {
-        display,
-        id: a.id ?? "unknown",
-        bot: Boolean(a.bot),
-        system: Boolean(a.system)
+        display: globalName
+            ? `${globalName} (@${username}${discriminator})`
+            : `@${username}${discriminator}`,
+        username,
+        globalName,
+        id: author.id ?? "unknown",
+        bot: Boolean(author.bot),
+        system: Boolean(author.system)
     };
 }
 
 function attachmentLines(message) {
-    const list = toArray(message?.attachments);
-    if (!list.length) return [];
+    const attachments = toArray(message?.attachments);
+    if (!attachments.length) return [];
+
     const lines = ["Вложения:"];
-    for (const a of list) {
-        const name = a?.filename ?? a?.name ?? "file";
-        const url = a?.url ?? a?.proxy_url ?? a?.proxyURL ?? "";
-        const type = a?.content_type ?? a?.contentType ?? "";
-        const size = a?.size != null ? `${a.size} bytes` : "";
-        const dims = a?.width && a?.height ? `${a.width}x${a.height}` : "";
-        const meta = [type, size, dims].filter(Boolean).join(", ");
-        lines.push(`  ${name}${meta ? ` (${meta})` : ""}${url ? `\n  ${url}` : ""}`);
-    }
+
+    attachments.forEach((attachment, index) => {
+        const name = attachment?.filename ?? attachment?.name ?? "file";
+        const url = attachment?.url ?? attachment?.proxy_url ?? attachment?.proxyURL ?? "";
+        const type = attachment?.content_type ?? attachment?.contentType ?? "";
+        const size = attachment?.size ?? "";
+        const width = attachment?.width ?? "";
+        const height = attachment?.height ?? "";
+
+        lines.push(
+            `${index + 1}. ${name}` +
+            `${type ? ` | type=${type}` : ""}` +
+            `${size !== "" ? ` | size=${size}` : ""}` +
+            `${width && height ? ` | ${width}x${height}` : ""}` +
+            `${url ? `\n${url}` : ""}`
+        );
+    });
+
     return lines;
 }
 
 function embedLines(message) {
     const embeds = toArray(message?.embeds);
     if (!embeds.length) return [];
+
     const lines = ["Embeds:"];
-    embeds.forEach((e, i) => {
-        const bits = [
-            e?.type ? `type=${e.type}` : null,
-            e?.title ? `title=${e.title}` : null,
-            e?.description ? `description=${e.description}` : null,
-            e?.url ? `url=${e.url}` : null
-        ].filter(Boolean);
-        lines.push(`  ${i + 1}. ${bits.join(" | ") || "embed"}`);
+
+    embeds.forEach((embed, index) => {
+        lines.push(
+            `${index + 1}. ` +
+            [
+                embed?.type ? `type=${embed.type}` : null,
+                embed?.title ? `title=${embed.title}` : null,
+                embed?.description ? `description=${embed.description}` : null,
+                embed?.url ? `url=${embed.url}` : null
+            ].filter(Boolean).join(" | ")
+        );
     });
+
     return lines;
 }
 
 function reactionLines(message) {
     const reactions = toArray(message?.reactions);
     if (!reactions.length) return [];
-    const parts = reactions.map(r => {
-        const emoji = r?.emoji?.name ?? r?.emoji?.id ?? "?";
-        const count = r?.count ?? 0;
-        return `${emoji} x${count}`;
-    });
-    return [`Реакции: ${parts.join(", ")}`];
+
+    return [
+        "Реакции: " +
+        reactions.map(reaction => {
+            const emoji = reaction?.emoji?.name ?? reaction?.emoji?.id ?? "?";
+            return `${emoji} x${reaction?.count ?? 0}`;
+        }).join(", ")
+    ];
 }
 
 function stickerLines(message) {
-    const stickers = toArray(message?.sticker_items ?? message?.stickerItems ?? message?.stickers);
-    if (!stickers.length) return [];
-    return stickers.map(s => `Стикер: ${s?.name ?? "unknown"} | id=${s?.id ?? "unknown"} | format=${s?.format_type ?? s?.formatType ?? "unknown"}`);
+    const stickers = toArray(
+        message?.sticker_items ??
+        message?.stickerItems ??
+        message?.stickers
+    );
+
+    return stickers.map(sticker =>
+        `Стикер: ${sticker?.name ?? "unknown"} | ` +
+        `id=${sticker?.id ?? "unknown"} | ` +
+        `format=${sticker?.format_type ?? sticker?.formatType ?? "unknown"}`
+    );
 }
 
 function replyLines(message) {
-    const ref = message?.message_reference ?? message?.messageReference;
+    const reference = message?.message_reference ?? message?.messageReference;
     const referenced = message?.referenced_message ?? message?.referencedMessage;
-    if (!ref && !referenced) return [];
+
+    if (!reference && !referenced) return [];
 
     const lines = [];
-    if (ref) {
+
+    if (reference) {
         lines.push(
-            `Ответ на: message_id=${ref.message_id ?? ref.messageId ?? "unknown"} | ` +
-            `channel_id=${ref.channel_id ?? ref.channelId ?? "unknown"} | ` +
-            `guild_id=${ref.guild_id ?? ref.guildId ?? "unknown"}`
+            "Ответ на: " +
+            `message_id=${reference.message_id ?? reference.messageId ?? "unknown"} | ` +
+            `channel_id=${reference.channel_id ?? reference.channelId ?? "unknown"} | ` +
+            `guild_id=${reference.guild_id ?? reference.guildId ?? "unknown"}`
         );
     }
 
     if (referenced) {
-        const a = authorInfo(referenced);
-        lines.push(`Цитируемый автор: ${a.display} | author_id=${a.id}`);
-        if (referenced.content) lines.push(`Цитируемый текст: ${referenced.content}`);
+        const author = authorInfo(referenced);
+        lines.push(`Цитируемый автор: ${author.display} | author_id=${author.id}`);
+
+        if (referenced.content) {
+            lines.push(`Цитируемый текст: ${referenced.content}`);
+        }
     }
+
     return lines;
 }
 
 function messageToText(message) {
     const m = cleanSnapshot(message);
     const author = authorInfo(m);
-    const channelId = m?.channel_id ?? m?.channelId ?? "unknown";
-    const guildId = m?.guild_id ?? m?.guildId ?? "unknown";
+
     const timestamp = m?.timestamp ?? m?.created_at ?? m?.createdAt;
     const edited = m?.edited_timestamp ?? m?.editedTimestamp;
-    const type = m?.type ?? "unknown";
-    const flags = m?.flags ?? 0;
 
     const lines = [
         `Время: ${formatTime(timestamp)}`,
         `Автор: ${author.display}`,
+        `username: ${author.username}`,
+        `global_name: ${author.globalName ?? ""}`,
         `author_id: ${author.id}`,
         `message_id: ${m?.id ?? "unknown"}`,
-        `channel_id: ${channelId}`,
-        `guild_id: ${guildId}`,
-        `type: ${type}`,
-        `flags: ${flags}`,
+        `channel_id: ${channelOf(m) ?? "unknown"}`,
+        `guild_id: ${m?.guild_id ?? m?.guildId ?? "unknown"}`,
+        `type: ${m?.type ?? "unknown"}`,
+        `flags: ${m?.flags ?? 0}`,
         `bot: ${author.bot}`,
         `system: ${author.system}`
     ];
 
     if (edited) lines.push(`Изменено: ${formatTime(edited)}`);
+
     lines.push(...replyLines(m));
 
     const mentions = toArray(m?.mentions);
     if (mentions.length) {
-        lines.push(`Упоминания: ${mentions.map(u => `${u?.username ?? u?.global_name ?? "user"}(${u?.id ?? "?"})`).join(", ")}`);
+        lines.push(
+            "Упоминания: " +
+            mentions.map(user =>
+                `${user?.username ?? user?.global_name ?? "user"}(${user?.id ?? "?"})`
+            ).join(", ")
+        );
     }
 
-    const roleMentions = toArray(m?.mention_roles ?? m?.mentionRoles);
-    if (roleMentions.length) lines.push(`Упомянутые роли: ${roleMentions.join(", ")}`);
+    const roles = toArray(m?.mention_roles ?? m?.mentionRoles);
+    if (roles.length) {
+        lines.push(`Упомянутые роли: ${roles.join(", ")}`);
+    }
 
     lines.push("Текст:");
-    lines.push(typeof m?.content === "string" && m.content.length ? m.content : "(без текста)");
+    lines.push(
+        typeof m?.content === "string" && m.content.length
+            ? m.content
+            : "(без текста)"
+    );
+
     lines.push(...attachmentLines(m));
     lines.push(...embedLines(m));
     lines.push(...stickerLines(m));
@@ -298,10 +373,14 @@ function sortMessages(messages) {
     return messages.sort((a, b) => {
         const at = Date.parse(a?.timestamp ?? "");
         const bt = Date.parse(b?.timestamp ?? "");
-        if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt;
+
+        if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) {
+            return at - bt;
+        }
 
         const ai = String(a?.id ?? "");
         const bi = String(b?.id ?? "");
+
         if (ai.length !== bi.length) return ai.length - bi.length;
         return ai.localeCompare(bi);
     });
@@ -309,6 +388,7 @@ function sortMessages(messages) {
 
 function copySelected() {
     const messages = sortMessages(Array.from(selected.values()));
+
     if (!messages.length) {
         toast("Нет выбранных сообщений");
         return;
@@ -319,17 +399,18 @@ function copySelected() {
         .join("\n\n====================\n\n");
 
     clipboard.setString(text);
+
     const count = messages.length;
     cancelSelection(false);
     toast(`Скопировано сообщений: ${count}`);
 }
 
 function makeRow(label, onPress) {
-    const iconSource = copyIcon();
     const props = { label, onPress };
+    const icon = copyIcon();
 
-    if (ActionSheetRow?.Icon && iconSource) {
-        props.icon = React.createElement(ActionSheetRow.Icon, { source: iconSource });
+    if (ActionSheetRow?.Icon && icon && React?.createElement) {
+        props.icon = React.createElement(ActionSheetRow.Icon, { source: icon });
     }
 
     return React.createElement(ActionSheetRow, props);
@@ -347,139 +428,237 @@ function injectSelectionActions(buttons, message) {
     const rows = [];
 
     if (!selectionMode) {
-        rows.push(mark(makeRow("Выбрать сообщение", () => beginSelection(message))));
+        rows.push(
+            mark(
+                makeRow(
+                    "Выбрать сообщение",
+                    () => beginSelection(message)
+                )
+            )
+        );
     } else {
-        const key = messageKey(message);
-        const isSelected = selected.has(key);
+        const isSelected = selected.has(messageKey(message));
 
-        rows.push(mark(makeRow(
-            isSelected ? "Убрать это сообщение из выбора" : "Добавить это сообщение",
-            () => {
-                toggleSelected(message);
-                LazyActionSheet?.hideActionSheet?.();
-            }
-        )));
+        rows.push(
+            mark(
+                makeRow(
+                    isSelected
+                        ? "Убрать это сообщение из выбора"
+                        : "Добавить это сообщение",
+                    () => {
+                        toggleSelected(message);
+                        try { LazyActionSheet?.hideActionSheet?.(); } catch (_) {}
+                    }
+                )
+            )
+        );
 
         if (selected.size > 0) {
-            rows.push(mark(makeRow(`Скопировать выбранные (${selected.size})`, copySelected)));
+            rows.push(
+                mark(
+                    makeRow(
+                        `Скопировать выбранные (${selected.size})`,
+                        copySelected
+                    )
+                )
+            );
         }
 
-        rows.push(mark(makeRow("Отменить весь выбор", () => cancelSelection(true))));
+        rows.push(
+            mark(
+                makeRow(
+                    "Отменить весь выбор",
+                    () => cancelSelection(true)
+                )
+            )
+        );
     }
 
     buttons.splice(0, 0, ...rows);
 }
 
+function processTapArgs(args) {
+    if (!selectionMode) return;
+
+    try {
+        const payload = args?.[0];
+        const nativeEvent = payload?.nativeEvent ?? payload;
+
+        const channelId =
+            nativeEvent?.channelId ??
+            nativeEvent?.channel_id ??
+            payload?.message?.channel_id ??
+            payload?.message?.channelId ??
+            selectionChannelId;
+
+        const messageId =
+            nativeEvent?.messageId ??
+            nativeEvent?.message_id ??
+            payload?.message?.id;
+
+        if (!channelId || !messageId) return;
+
+        const message = getMessage(channelId, messageId, payload?.message);
+        if (!message) return;
+
+        toggleSelected({
+            ...message,
+            channel_id: channelId
+        });
+    } catch (_) {}
+}
+
 function patchMessageTapHandlers(handlers) {
-    if (!handlers || handlers.__telegramSelectionPatched) return;
-    handlers.__telegramSelectionPatched = true;
+    if (!handlers || patchedHandlers.has(handlers)) return;
+    if (typeof handlers.handleTapMessage !== "function") return;
+
     patchedHandlers.add(handlers);
 
-    if (typeof handlers.handleTapMessage === "function") {
-        const unpatch = instead("handleTapMessage", handlers, (args, original) => {
-            if (!selectionMode) return original.apply(handlers, args);
+    try {
+        const unpatch = after(
+            "handleTapMessage",
+            handlers,
+            args => processTapArgs(args)
+        );
 
-            try {
-                const payload = args?.[0];
-                const nativeEvent = payload?.nativeEvent ?? payload;
-                const channelId =
-                    nativeEvent?.channelId ??
-                    nativeEvent?.channel_id ??
-                    payload?.message?.channel_id ??
-                    payload?.message?.channelId ??
-                    selectionChannelId;
-                const messageId =
-                    nativeEvent?.messageId ??
-                    nativeEvent?.message_id ??
-                    payload?.message?.id;
-
-                if (!channelId || !messageId) {
-                    return original.apply(handlers, args);
-                }
-
-                const message = getMessage(channelId, messageId, payload?.message);
-                if (!message) {
-                    return original.apply(handlers, args);
-                }
-
-                toggleSelected({ ...message, channel_id: channelId });
-                return;
-            } catch (_) {
-                return original.apply(handlers, args);
-            }
-        });
-        handlerPatches.push(unpatch);
+        handlerUnpatches.push(unpatch);
+    } catch (_) {
+        patchedHandlers.delete(handlers);
     }
+}
+
+function restoreTapHooks() {
+    handlerUnpatches.forEach(unpatch => {
+        try { unpatch(); } catch (_) {}
+    });
+    handlerUnpatches = [];
+
+    getterRestorers.forEach(restore => {
+        try { restore(); } catch (_) {}
+    });
+    getterRestorers = [];
+
+    patchedHandlers.clear();
+    hookedPrototype = null;
+}
+
+function ensureTapHooks() {
+    try {
+        const module = findByProps("MessagesHandlers");
+        const MessagesHandlers = module?.MessagesHandlers;
+        const prototype = MessagesHandlers?.prototype;
+
+        if (!prototype) return false;
+        if (hookedPrototype === prototype) return true;
+
+        restoreTapHooks();
+        hookedPrototype = prototype;
+
+        patchMessageTapHandlers(prototype);
+
+        const names = ["params", "handlers", "_params", "messageHandlers"];
+
+        for (const name of names) {
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+            const originalGetter = descriptor?.get;
+
+            if (!originalGetter) continue;
+
+            Object.defineProperty(prototype, name, {
+                ...descriptor,
+                configurable: true,
+                get() {
+                    const value = originalGetter.call(this);
+
+                    try { patchMessageTapHandlers(this); } catch (_) {}
+                    try { patchMessageTapHandlers(value); } catch (_) {}
+
+                    return value;
+                }
+            });
+
+            getterRestorers.push(() => {
+                try {
+                    Object.defineProperty(prototype, name, descriptor);
+                } catch (_) {}
+            });
+        }
+
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function patchActionSheet() {
+    if (!LazyActionSheet) return;
+
+    const unpatch = before(
+        "openLazy",
+        LazyActionSheet,
+        ([component, key, msg]) => {
+            const message = msg?.message;
+
+            if (
+                key !== "MessageLongPressActionSheet" ||
+                !message ||
+                !component?.then
+            ) {
+                return;
+            }
+
+            component.then(instance => {
+                const sheetUnpatch = after(
+                    "default",
+                    instance,
+                    (_, result) => {
+                        setTimeout(() => {
+                            try { sheetUnpatch(); } catch (_) {}
+                        }, 0);
+
+                        const buttons = findInReactTree(
+                            result,
+                            node =>
+                                Array.isArray(node) &&
+                                node.some?.(
+                                    item =>
+                                        item?.type?.name === "ActionSheetRow" ||
+                                        item?.props?.label
+                                )
+                        );
+
+                        if (!buttons) return;
+
+                        const channelId = channelOf(message);
+                        const current = getMessage(
+                            channelId,
+                            message.id,
+                            message
+                        );
+
+                        injectSelectionActions(buttons, current);
+                    }
+                );
+            });
+        }
+    );
+
+    actionSheetUnpatches.push(unpatch);
 }
 
 const pluginDefinition = {
     onLoad() {
-        patches.push(before("openLazy", LazyActionSheet, ([component, key, msg]) => {
-            const message = msg?.message;
-            if (key !== "MessageLongPressActionSheet" || !message || !component?.then) return;
-
-            component.then(instance => {
-                const unpatch = after("default", instance, (_, res) => {
-                    setTimeout(unpatch, 0);
-
-                    const buttons = findInReactTree(
-                        res,
-                        node => Array.isArray(node) && node.some?.(x => x?.type?.name === "ActionSheetRow" || x?.props?.label)
-                    );
-
-                    if (!buttons) return;
-                    const current = getMessage(message.channel_id ?? message.channelId, message.id, message);
-                    injectSelectionActions(buttons, current);
-                });
-            });
-        }));
-
-        if (MessagesHandlers?.prototype) {
-            const descriptor = Object.getOwnPropertyDescriptor(MessagesHandlers.prototype, "params");
-            const originalGetter = descriptor?.get;
-
-            if (originalGetter) {
-                Object.defineProperty(MessagesHandlers.prototype, "params", {
-                    configurable: true,
-                    get() {
-                        patchMessageTapHandlers(this);
-                        return originalGetter.call(this);
-                    }
-                });
-
-                unpatchGetter = () => {
-                    try {
-                        Object.defineProperty(MessagesHandlers.prototype, "params", {
-                            ...descriptor,
-                            get: originalGetter
-                        });
-                    } catch (_) {}
-                };
-            }
-        }
+        patchActionSheet();
+        ensureTapHooks();
     },
 
     onUnload() {
-        patches.forEach(fn => {
-            try { fn(); } catch (_) {}
+        actionSheetUnpatches.forEach(unpatch => {
+            try { unpatch(); } catch (_) {}
         });
-        patches = [];
+        actionSheetUnpatches = [];
 
-        handlerPatches.forEach(fn => {
-            try { fn(); } catch (_) {}
-        });
-        handlerPatches = [];
-
-        if (unpatchGetter) {
-            try { unpatchGetter(); } catch (_) {}
-            unpatchGetter = null;
-        }
-
-        patchedHandlers.forEach(handlers => {
-            try { delete handlers.__telegramSelectionPatched; } catch (_) {}
-        });
-        patchedHandlers.clear();
-
+        restoreTapHooks();
         cancelSelection(false);
     }
 };
@@ -487,4 +666,14 @@ const pluginDefinition = {
 exports.default = pluginDefinition;
 Object.defineProperty(exports, "__esModule", { value: true });
 return exports;
-})({}, vendetta.metro, vendetta.metro.common, vendetta.patcher, vendetta.ui.assets, vendetta.ui.components, vendetta.ui.toasts, vendetta.utils);
+
+})(
+    {},
+    vendetta.metro,
+    vendetta.metro.common,
+    vendetta.patcher,
+    vendetta.ui.assets,
+    vendetta.ui.components,
+    vendetta.ui.toasts,
+    vendetta.utils
+);
