@@ -1,1 +1,1 @@
-{"name":"Telegram Selection v0.7.0","description":"Build 0.7.0. Multi-message selection with tap diagnostics for Discord mobile.","authors":[{"name":"Biba + Omega","id":"0"}],"main":"index.js","vendetta":{"icon":"ic_message_copy"},"hash":"23462448131c46e2d18412e0df7a8a7d7575a62e42aff3cff4c5d77c0bcbb99f"}
+{"name":"Telegram Selection SAFE v0.7.1","description":"Recovery build. No hooks are loaded.","authors":[{"name":"Biba + Omega","id":"0"}],"main":"index.js","vendetta":{"icon":"ic_message_copy"},"hash":"c45938a3a3b68245406743829b808f8efcd63d8bb1b5753f6dd2a8968a62c204"}
